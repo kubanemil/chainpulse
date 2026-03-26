@@ -1193,6 +1193,7 @@ dependencies = [
  "chainpulse-db",
  "chainpulse-types",
  "futures-util",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

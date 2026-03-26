@@ -1,8 +1,6 @@
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::rpc::types::Filter;
-use alloy::eips::BlockNumberOrTag;
-use futures_util::StreamExt;
 use tracing_subscriber::EnvFilter;
+
+mod indexer;
 
 #[tokio::main]
 async fn main() {
@@ -43,71 +41,5 @@ async fn main() {
 
     tracing::info!("Database connected, migrations applied");
 
-    // ── WebSocket connection ─────────────────────────────────────────────
-    let ws = WsConnect::new(&config.eth_rpc_ws_url);
-    let provider = match ProviderBuilder::new().connect_ws(ws).await {
-        Ok(provider) => provider,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to connect WebSocket to Ethereum");
-            std::process::exit(1);
-        }
-    };
-
-    tracing::info!("WebSocket connected to Ethereum");
-
-    // ── Log subscription ─────────────────────────────────────────────────
-    let contracts = chainpulse_types::default_contracts();
-    let num_contracts = contracts.len();
-
-    let filter = Filter::new()
-        .address(contracts)
-        .from_block(BlockNumberOrTag::Latest);
-
-    let sub = match provider.subscribe_logs(&filter).await {
-        Ok(sub) => sub,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to subscribe to logs");
-            std::process::exit(1);
-        }
-    };
-
-    let mut stream = sub.into_stream();
-
-    tracing::info!(contract_count = num_contracts, "Subscribed to logs for {} contracts", num_contracts);
-
-    // ── Event processing loop ────────────────────────────────────────────
-    while let Some(log) = stream.next().await {
-        if let Some(event) = chainpulse_types::decode_log(&log) {
-            match chainpulse_db::insert_event(
-                &pool,
-                event.chain_id,
-                event.block_number,
-                event.log_index,
-                &event.tx_hash,
-                &event.contract_address,
-                &event.event_type,
-                &event.payload,
-            )
-            .await
-            {
-                Ok(_) => {
-                    tracing::info!(
-                        event_type = %event.event_type,
-                        block_number = event.block_number,
-                        contract_address = %event.contract_address,
-                        "Event indexed"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to write event to database");
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            tracing::debug!("Skipping unknown event");
-        }
-    }
-
-    tracing::error!("WebSocket stream ended");
-    std::process::exit(1);
+    indexer::run_indexer(&pool, &config).await;
 }
