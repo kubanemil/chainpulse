@@ -1,5 +1,8 @@
 use chainpulse_types::NormalizedEvent;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::FromRow;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -157,4 +160,160 @@ pub async fn batch_upsert_last_indexed_blocks(
     }
 
     Ok(())
+}
+
+/// Full database row representation of an event, used for API responses.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct EventRow {
+    pub id: i64,
+    pub chain_id: i32,
+    pub block_number: i64,
+    pub log_index: i32,
+    pub tx_hash: String,
+    pub contract_address: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub block_timestamp: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Optional filter parameters for querying events.
+#[derive(Debug, Default)]
+pub struct EventFilter {
+    pub chain_id: Option<i32>,
+    pub event_type: Option<String>,
+    pub contract_address: Option<String>,
+    pub block_min: Option<i64>,
+    pub block_max: Option<i64>,
+}
+
+/// Build the WHERE clause and collect bind parameter values.
+/// Returns (where_clause, bind_values) where bind_values is a vec of boxed
+/// values that must be bound in order.
+fn build_where_clause(filter: &EventFilter) -> (String, Vec<BindValue>) {
+    let mut clauses = Vec::new();
+    let mut binds: Vec<BindValue> = Vec::new();
+    let mut idx = 1u32;
+
+    if let Some(chain_id) = filter.chain_id {
+        clauses.push(format!("chain_id = ${idx}"));
+        binds.push(BindValue::I32(chain_id));
+        idx += 1;
+    }
+    if let Some(ref event_type) = filter.event_type {
+        clauses.push(format!("event_type = ${idx}"));
+        binds.push(BindValue::String(event_type.clone()));
+        idx += 1;
+    }
+    if let Some(ref contract_address) = filter.contract_address {
+        clauses.push(format!("contract_address = ${idx}"));
+        binds.push(BindValue::String(contract_address.clone()));
+        idx += 1;
+    }
+    if let Some(block_min) = filter.block_min {
+        clauses.push(format!("block_number >= ${idx}"));
+        binds.push(BindValue::I64(block_min));
+        idx += 1;
+    }
+    if let Some(block_max) = filter.block_max {
+        clauses.push(format!("block_number <= ${idx}"));
+        binds.push(BindValue::I64(block_max));
+        #[allow(unused_assignments)]
+        { idx += 1; }
+    }
+
+    let where_sql = if clauses.is_empty() {
+        String::from("WHERE 1=1")
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+
+    (where_sql, binds)
+}
+
+/// Internal enum to hold typed bind values for dynamic query construction.
+enum BindValue {
+    I32(i32),
+    I64(i64),
+    String(String),
+}
+
+/// Bind all values from a `Vec<BindValue>` to a sqlx query.
+fn bind_values<'q>(
+    mut query: sqlx::query::QueryAs<'q, sqlx::Postgres, EventRow, sqlx::postgres::PgArguments>,
+    binds: &'q [BindValue],
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, EventRow, sqlx::postgres::PgArguments> {
+    for bind in binds {
+        query = match bind {
+            BindValue::I32(v) => query.bind(v),
+            BindValue::I64(v) => query.bind(v),
+            BindValue::String(v) => query.bind(v),
+        };
+    }
+    query
+}
+
+/// Bind all values to a scalar (i64) query.
+fn bind_values_scalar<'q>(
+    mut query: sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments>,
+    binds: &'q [BindValue],
+) -> sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments> {
+    for bind in binds {
+        query = match bind {
+            BindValue::I32(v) => query.bind(v),
+            BindValue::I64(v) => query.bind(v),
+            BindValue::String(v) => query.bind(v),
+        };
+    }
+    query
+}
+
+/// Query events with optional filters, pagination (LIMIT/OFFSET), ordered by id DESC.
+pub async fn query_events(
+    pool: &PgPool,
+    filter: &EventFilter,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<EventRow>, DbError> {
+    let (where_sql, binds) = build_where_clause(filter);
+    let next_idx = binds.len() as u32 + 1;
+
+    let sql = format!(
+        "SELECT id, chain_id, block_number, log_index, tx_hash, contract_address, event_type, payload, block_timestamp, created_at \
+         FROM events {where_sql} ORDER BY id DESC LIMIT ${} OFFSET ${}",
+        next_idx,
+        next_idx + 1,
+    );
+
+    let query = sqlx::query_as::<_, EventRow>(&sql);
+    let query = bind_values(query, &binds);
+    let rows = query.bind(limit).bind(offset).fetch_all(pool).await?;
+
+    Ok(rows)
+}
+
+/// Count events matching the given filter (same WHERE clause as query_events, no LIMIT/OFFSET).
+pub async fn count_events(pool: &PgPool, filter: &EventFilter) -> Result<i64, DbError> {
+    let (where_sql, binds) = build_where_clause(filter);
+
+    let sql = format!("SELECT COUNT(*) FROM events {where_sql}");
+
+    let query = sqlx::query_scalar::<_, i64>(&sql);
+    let query = bind_values_scalar(query, &binds);
+    let count = query.fetch_one(pool).await?;
+
+    Ok(count)
+}
+
+/// Get a single event by its primary key ID.
+pub async fn get_event_by_id(pool: &PgPool, id: i64) -> Result<Option<EventRow>, DbError> {
+    let row = sqlx::query_as::<_, EventRow>(
+        "SELECT id, chain_id, block_number, log_index, tx_hash, contract_address, event_type, payload, block_timestamp, created_at \
+         FROM events WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
 }

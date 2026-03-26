@@ -1,5 +1,6 @@
 use tracing_subscriber::EnvFilter;
 
+mod api;
 mod db_writer;
 mod indexer;
 
@@ -78,6 +79,13 @@ async fn main() {
         config.flush_interval_ms,
     ));
 
+    // Spawn the API server task (read-only access to the database)
+    let api_handle = tokio::spawn(api::start_server(
+        config.server_host.clone(),
+        config.server_port,
+        pool.clone(),
+    ));
+
     // Spawn one indexer task per chain
     let mut handles = Vec::new();
     for chain_config in chain_configs {
@@ -96,36 +104,53 @@ async fn main() {
     // Drop the original sender so the channel closes when all indexer tasks exit
     drop(tx);
 
-    // Wait for all indexer handles; if any task exits (error or panic), log and exit
-    let results = futures_util::future::join_all(handles).await;
+    // Monitor all tasks: if any critical task exits, log and shut down
+    tokio::select! {
+        results = futures_util::future::join_all(handles) => {
+            for result in results {
+                match result {
+                    Ok(Ok(())) => {
+                        tracing::warn!("Indexer task exited normally (unexpected)");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "Indexer task exited with error");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Indexer task panicked");
+                    }
+                }
+            }
 
-    for result in results {
-        match result {
-            Ok(Ok(())) => {
-                tracing::warn!("Indexer task exited normally (unexpected)");
+            // All indexer senders are dropped; wait for DB writer to finish draining
+            match db_writer_handle.await {
+                Ok(Ok(())) => {
+                    tracing::info!("DB writer task exited normally");
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "DB writer task exited with error");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "DB writer task panicked");
+                }
             }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "Indexer task exited with error");
+
+            tracing::error!("All indexer tasks have exited, shutting down");
+        }
+        result = api_handle => {
+            match result {
+                Ok(Ok(())) => {
+                    tracing::error!("API server exited unexpectedly");
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "API server exited with error");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "API server task panicked");
+                }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "Indexer task panicked");
-            }
+            tracing::error!("API server has exited, shutting down");
         }
     }
 
-    // All indexer senders are dropped; wait for DB writer to finish draining
-    match db_writer_handle.await {
-        Ok(Ok(())) => {
-            tracing::info!("DB writer task exited normally");
-        }
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "DB writer task exited with error");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "DB writer task panicked");
-        }
-    }
-
-    tracing::error!("All indexer tasks have exited, shutting down");
     std::process::exit(1);
 }
