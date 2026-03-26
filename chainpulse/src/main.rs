@@ -1,5 +1,6 @@
 use tracing_subscriber::EnvFilter;
 
+mod db_writer;
 mod indexer;
 
 #[tokio::main]
@@ -57,6 +58,26 @@ async fn main() {
         },
     ];
 
+    // Create bounded MPSC channel for backpressure between indexers and DB writer
+    let (tx, rx) = tokio::sync::mpsc::channel::<chainpulse_types::NormalizedEvent>(
+        config.channel_buffer_size,
+    );
+
+    tracing::info!(
+        channel_buffer_size = config.channel_buffer_size,
+        batch_size = config.batch_size,
+        flush_interval_ms = config.flush_interval_ms,
+        "Bounded channel created"
+    );
+
+    // Spawn the DB writer task (owns the Receiver half and the pool for writes)
+    let db_writer_handle = tokio::spawn(db_writer::run(
+        rx,
+        pool.clone(),
+        config.batch_size,
+        config.flush_interval_ms,
+    ));
+
     // Spawn one indexer task per chain
     let mut handles = Vec::new();
     for chain_config in chain_configs {
@@ -67,11 +88,15 @@ async fn main() {
             "Spawning indexer task"
         );
         let pool_clone = pool.clone();
-        let handle = tokio::spawn(indexer::run_indexer(pool_clone, chain_config));
+        let tx_clone = tx.clone();
+        let handle = tokio::spawn(indexer::run_indexer(pool_clone, chain_config, tx_clone));
         handles.push(handle);
     }
 
-    // Wait for all handles; if any task exits (error or panic), log and exit
+    // Drop the original sender so the channel closes when all indexer tasks exit
+    drop(tx);
+
+    // Wait for all indexer handles; if any task exits (error or panic), log and exit
     let results = futures_util::future::join_all(handles).await;
 
     for result in results {
@@ -85,6 +110,19 @@ async fn main() {
             Err(e) => {
                 tracing::error!(error = %e, "Indexer task panicked");
             }
+        }
+    }
+
+    // All indexer senders are dropped; wait for DB writer to finish draining
+    match db_writer_handle.await {
+        Ok(Ok(())) => {
+            tracing::info!("DB writer task exited normally");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "DB writer task exited with error");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "DB writer task panicked");
         }
     }
 

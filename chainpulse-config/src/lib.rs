@@ -31,6 +31,10 @@ fn default_batch_size() -> usize {
     100
 }
 
+fn default_flush_interval_ms() -> u64 {
+    500
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub database_url: String,
@@ -54,6 +58,9 @@ pub struct Config {
 
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    #[serde(default = "default_flush_interval_ms")]
+    pub flush_interval_ms: u64,
 }
 
 impl Config {

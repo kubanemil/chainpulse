@@ -2,9 +2,12 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use alloy::eips::BlockNumberOrTag;
+use chainpulse_types::NormalizedEvent;
 use futures_util::StreamExt;
 use sqlx::PgPool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::Instrument;
 
 /// Number of blocks to fetch per `eth_getLogs` chunk during catch-up.
@@ -41,7 +44,7 @@ impl std::fmt::Display for IndexerError {
 /// Outer reconnection loop. Contains backoff state and calls
 /// `run_session` in a loop, applying exponential backoff on failure.
 /// Returns `Result<(), IndexerError>` so it can be spawned as a Tokio task.
-pub async fn run_indexer(pool: PgPool, config: ChainConfig) -> Result<(), IndexerError> {
+pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<NormalizedEvent>) -> Result<(), IndexerError> {
     let span = tracing::info_span!("chain", name = %config.name, chain_id = config.chain_id);
 
     async {
@@ -60,7 +63,7 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig) -> Result<(), Indexe
                 );
             }
 
-            match run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count).await {
+            match run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count, &tx).await {
                 Ok(()) => {
                     // Stream ended normally (WS disconnect) — treat as recoverable
                     tracing::warn!(
@@ -102,6 +105,7 @@ pub async fn run_session(
     contracts: Vec<Address>,
     chain_id: i32,
     retry_count: u32,
+    tx: &Sender<NormalizedEvent>,
 ) -> Result<(), IndexerError> {
     // Connect WebSocket
     let ws = WsConnect::new(ws_url);
@@ -118,7 +122,7 @@ pub async fn run_session(
     }
 
     // Run catch-up before subscribing to live logs
-    catch_up(&provider, pool, &contracts, chain_id).await?;
+    catch_up(&provider, pool, &contracts, chain_id, tx).await?;
 
     // Determine the starting block for the live subscription.
     // If we have a last indexed block from DB (set by catch_up or prior runs),
@@ -160,47 +164,16 @@ pub async fn run_session(
         num_contracts
     );
 
-    // Event processing loop
+    // Event processing loop -- send events to bounded channel with backpressure detection
     while let Some(log) = stream.next().await {
         if let Some(event) = chainpulse_types::decode_log(&log, chain_id) {
-            match chainpulse_db::insert_event(
-                pool,
-                event.chain_id,
-                event.block_number,
-                event.log_index,
-                &event.tx_hash,
-                &event.contract_address,
-                &event.event_type,
-                &event.payload,
-            )
-            .await
-            {
-                Ok(_) => {
-                    tracing::info!(
-                        event_type = %event.event_type,
-                        block_number = event.block_number,
-                        contract_address = %event.contract_address,
-                        "Event indexed"
-                    );
-                    if let Err(e) =
-                        chainpulse_db::upsert_last_indexed_block(pool, chain_id, event.block_number)
-                            .await
-                    {
-                        return Err(IndexerError::Fatal(format!(
-                            "Failed to update last indexed block: {e}"
-                        )));
-                    }
-                    tracing::debug!(
-                        block_number = event.block_number,
-                        "Block tracking updated"
-                    );
-                }
-                Err(e) => {
-                    return Err(IndexerError::Fatal(format!(
-                        "Failed to write event to database: {e}"
-                    )));
-                }
-            }
+            tracing::info!(
+                event_type = %event.event_type,
+                block_number = event.block_number,
+                contract_address = %event.contract_address,
+                "Sending event to channel"
+            );
+            backpressure_send(tx, event, chain_id).await?;
         } else {
             tracing::debug!("Skipping unknown event");
         }
@@ -223,6 +196,7 @@ async fn catch_up(
     pool: &PgPool,
     contracts: &[Address],
     chain_id: i32,
+    tx: &Sender<NormalizedEvent>,
 ) -> Result<(), IndexerError> {
     let last_indexed = chainpulse_db::get_last_indexed_block(pool, chain_id)
         .await
@@ -264,7 +238,7 @@ async fn catch_up(
         );
 
         let chunk_events =
-            fetch_logs_chunk(provider, pool, contracts, chain_id, chunk_from, chunk_to).await?;
+            fetch_logs_chunk(provider, pool, contracts, chain_id, chunk_from, chunk_to, tx).await?;
 
         total_events = total_events.saturating_add(chunk_events);
         chunk_from = chunk_to.saturating_add(1);
@@ -287,11 +261,12 @@ async fn catch_up(
 /// can retry from the last completed chunk.
 async fn fetch_logs_chunk(
     provider: &impl Provider,
-    pool: &PgPool,
+    _pool: &PgPool,
     contracts: &[Address],
     chain_id: i32,
     from: u64,
     to: u64,
+    tx: &Sender<NormalizedEvent>,
 ) -> Result<u64, IndexerError> {
     let filter = Filter::new()
         .address(contracts.to_vec())
@@ -307,28 +282,12 @@ async fn fetch_logs_chunk(
 
     for log in &logs {
         if let Some(event) = chainpulse_types::decode_log(log, chain_id) {
-            chainpulse_db::insert_event(
-                pool,
-                event.chain_id,
-                event.block_number,
-                event.log_index,
-                &event.tx_hash,
-                &event.contract_address,
-                &event.event_type,
-                &event.payload,
-            )
-            .await
-            .map_err(|e| IndexerError::Fatal(format!("Failed to write catch-up event to database: {e}")))?;
-
+            backpressure_send(tx, event, chain_id).await?;
             events_count = events_count.saturating_add(1);
         }
     }
 
-    // Update last_indexed_block to the end of this chunk so that on crash we
-    // resume from chunk_to + 1, not from the beginning.
-    chainpulse_db::upsert_last_indexed_block(pool, chain_id, to as i64)
-        .await
-        .map_err(|e| IndexerError::Fatal(format!("Failed to update last indexed block: {e}")))?;
+    // Block tracking is handled by the DB writer task via batch_upsert_last_indexed_blocks.
 
     tracing::info!(
         chunk_from = from,
@@ -338,4 +297,44 @@ async fn fetch_logs_chunk(
     );
 
     Ok(events_count)
+}
+
+/// Send an event to the bounded channel with backpressure detection and logging.
+///
+/// Uses `try_send` first to detect whether the channel is full. If the channel
+/// is at capacity, logs a warning and falls back to the blocking `send().await`,
+/// which applies backpressure by suspending the calling task until space is available.
+/// Also instruments the total send duration so operators can observe backpressure latency.
+async fn backpressure_send(
+    tx: &Sender<NormalizedEvent>,
+    event: NormalizedEvent,
+    chain_id: i32,
+) -> Result<(), IndexerError> {
+    match tx.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(event)) => {
+            tracing::warn!(
+                chain_id = chain_id,
+                "Channel full, applying backpressure — subscriber will block until space is available"
+            );
+            let start = Instant::now();
+            tx.send(event).await.map_err(|e| {
+                IndexerError::Fatal(format!(
+                    "Channel send failed (DB writer crashed?): {e}"
+                ))
+            })?;
+            let wait_ms = start.elapsed().as_millis();
+            tracing::info!(
+                chain_id = chain_id,
+                backpressure_wait_ms = wait_ms,
+                "Backpressure relieved, send completed"
+            );
+            Ok(())
+        }
+        Err(TrySendError::Closed(_)) => {
+            Err(IndexerError::Fatal(
+                "Channel closed (DB writer crashed?)".to_string(),
+            ))
+        }
+    }
 }

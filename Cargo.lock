@@ -1213,6 +1213,7 @@ dependencies = [
 name = "chainpulse-db"
 version = "0.1.0"
 dependencies = [
+ "chainpulse-types",
  "serde_json",
  "sqlx",
  "thiserror 2.0.18",

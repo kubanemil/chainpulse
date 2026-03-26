@@ -1,4 +1,6 @@
+use chainpulse_types::NormalizedEvent;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -76,4 +78,83 @@ pub async fn insert_event(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Insert multiple events in a single multi-row INSERT statement within a transaction.
+/// Uses `ON CONFLICT (chain_id, block_number, log_index) DO NOTHING` for idempotency.
+/// Returns the number of rows actually inserted.
+pub async fn batch_insert_events(pool: &PgPool, events: &[NormalizedEvent]) -> Result<u64, DbError> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // Build multi-row INSERT: INSERT INTO events (...) VALUES ($1..$7), ($8..$14), ...
+    // Each event has 7 bind parameters.
+    let mut sql = String::from(
+        "INSERT INTO events (chain_id, block_number, log_index, tx_hash, contract_address, event_type, payload) VALUES ",
+    );
+
+    for (i, _) in events.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let base = i * 7;
+        sql.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+            base + 7,
+        ));
+    }
+
+    sql.push_str(" ON CONFLICT (chain_id, block_number, log_index) DO NOTHING");
+
+    let mut query = sqlx::query(&sql);
+    for event in events {
+        query = query
+            .bind(event.chain_id)
+            .bind(event.block_number)
+            .bind(event.log_index)
+            .bind(&event.tx_hash)
+            .bind(&event.contract_address)
+            .bind(&event.event_type)
+            .bind(&event.payload);
+    }
+
+    let result = query.execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    Ok(result.rows_affected())
+}
+
+/// For each (chain_id, max_block_number) pair, upsert the `indexed_blocks` table.
+/// Computes max block per chain_id from the provided events.
+pub async fn batch_upsert_last_indexed_blocks(
+    pool: &PgPool,
+    events: &[NormalizedEvent],
+) -> Result<(), DbError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    // Compute max block per chain_id
+    let mut chain_blocks: HashMap<i32, i64> = HashMap::new();
+    for event in events {
+        let entry = chain_blocks.entry(event.chain_id).or_insert(event.block_number);
+        if event.block_number > *entry {
+            *entry = event.block_number;
+        }
+    }
+
+    for (chain_id, block) in &chain_blocks {
+        upsert_last_indexed_block(pool, *chain_id, *block).await?;
+    }
+
+    Ok(())
 }
