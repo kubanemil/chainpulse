@@ -1,4 +1,3 @@
-use serde_json;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use thiserror::Error;
 
@@ -51,6 +50,7 @@ pub async fn upsert_last_indexed_block(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_event(
     pool: &PgPool,
     chain_id: i32,

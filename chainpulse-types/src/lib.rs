@@ -131,7 +131,7 @@ fn fmt_addr(addr: &alloy::primitives::Address) -> String {
 
 /// Decode a raw Alloy log into a NormalizedEvent by matching topic0 against
 /// all known event signature hashes.
-pub fn decode_log(log: &alloy::rpc::types::Log) -> Option<NormalizedEvent> {
+pub fn decode_log(log: &alloy::rpc::types::Log, chain_id: i32) -> Option<NormalizedEvent> {
     let topic0 = log.topic0()?;
 
     let block_number = log.block_number.unwrap_or(0) as i64;
@@ -246,7 +246,7 @@ pub fn decode_log(log: &alloy::rpc::types::Log) -> Option<NormalizedEvent> {
         tx_hash,
         block_number,
         log_index,
-        chain_id: 1,
+        chain_id,
         payload,
     })
 }
@@ -254,7 +254,7 @@ pub fn decode_log(log: &alloy::rpc::types::Log) -> Option<NormalizedEvent> {
 // ── default_contracts ──────────────────────────────────────────────────────
 
 /// Returns the hardcoded list of Ethereum mainnet contract addresses to track.
-pub fn default_contracts() -> Vec<alloy::primitives::Address> {
+pub fn default_eth_contracts() -> Vec<alloy::primitives::Address> {
     use alloy::primitives::address;
     vec![
         address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
@@ -265,6 +265,20 @@ pub fn default_contracts() -> Vec<alloy::primitives::Address> {
         address!("1F98431c8aD98523631AE4a59f267346ea31F984"), // Uniswap V3 Factory
         address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"), // Aave V3 Pool
         address!("4da27a545c0c5B758a6BA100e3a049001de870f5"), // stkAAVE
+    ]
+}
+
+/// Returns the hardcoded list of Polygon PoS contract addresses to track.
+pub fn default_polygon_contracts() -> Vec<alloy::primitives::Address> {
+    use alloy::primitives::address;
+    vec![
+        address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // USDC (bridged)
+        address!("3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), // USDC (native)
+        address!("c2132D05D31c914a87C6611C10748AEb04B58e8F"), // USDT
+        address!("0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), // WMATIC
+        address!("7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"), // WETH
+        address!("5757371414417b8C6CAad45bAeF941aBc7d3Ab32"), // QuickSwap Factory
+        address!("794a61358D6845594F94dc1DB02A252b5b4814aD"), // Aave V3 Pool
     ]
 }
 
@@ -320,7 +334,7 @@ mod tests {
             b256!("1111111111111111111111111111111111111111111111111111111111111111"),
         );
 
-        let event = decode_log(&log).expect("should decode Transfer");
+        let event = decode_log(&log, 1).expect("should decode Transfer");
         assert_eq!(event.event_type, "Transfer");
         assert_eq!(event.block_number, 18_000_000);
         assert_eq!(event.log_index, 5);
@@ -357,7 +371,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode SwapV2");
+        let event = decode_log(&log, 1).expect("should decode SwapV2");
         assert_eq!(event.event_type, "SwapV2");
         assert_eq!(event.payload["amount0_in"], "100");
         assert_eq!(event.payload["amount1_out"], "200");
@@ -390,7 +404,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode SwapV3");
+        let event = decode_log(&log, 1).expect("should decode SwapV3");
         assert_eq!(event.event_type, "SwapV3");
         assert_eq!(event.payload["amount0"], "500");
         assert_eq!(event.payload["amount1"], "-300");
@@ -419,7 +433,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode Supply");
+        let event = decode_log(&log, 1).expect("should decode Supply");
         assert_eq!(event.event_type, "Supply");
         assert_eq!(event.payload["amount"], "5000");
         assert_eq!(event.payload["referral_code"], 42);
@@ -446,7 +460,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode Withdraw");
+        let event = decode_log(&log, 1).expect("should decode Withdraw");
         assert_eq!(event.event_type, "Withdraw");
         assert_eq!(event.payload["amount"], "7777");
     }
@@ -471,7 +485,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode Staked");
+        let event = decode_log(&log, 1).expect("should decode Staked");
         assert_eq!(event.event_type, "Staked");
         assert_eq!(event.payload["amount"], "9999");
     }
@@ -497,7 +511,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode PairCreated");
+        let event = decode_log(&log, 1).expect("should decode PairCreated");
         assert_eq!(event.event_type, "PairCreated");
         assert_eq!(event.payload["pair_index"], "12345");
     }
@@ -524,7 +538,7 @@ mod tests {
             B256::ZERO,
         );
 
-        let event = decode_log(&log).expect("should decode PoolCreated");
+        let event = decode_log(&log, 1).expect("should decode PoolCreated");
         assert_eq!(event.event_type, "PoolCreated");
         assert_eq!(event.payload["fee"], 3000);
         assert_eq!(event.payload["tick_spacing"], 60);
@@ -542,7 +556,7 @@ mod tests {
             B256::ZERO,
         );
 
-        assert!(decode_log(&log).is_none());
+        assert!(decode_log(&log, 1).is_none());
     }
 
     #[test]
@@ -557,7 +571,7 @@ mod tests {
             B256::ZERO,
         );
 
-        assert!(decode_log(&log).is_none());
+        assert!(decode_log(&log, 1).is_none());
     }
 
     #[test]
@@ -577,19 +591,56 @@ mod tests {
             removed: false,
         };
 
-        assert!(decode_log(&log).is_none());
+        assert!(decode_log(&log, 1).is_none());
     }
 
     #[test]
-    fn test_default_contracts_count() {
-        let contracts = default_contracts();
+    fn test_default_eth_contracts_count() {
+        let contracts = default_eth_contracts();
         assert_eq!(contracts.len(), 8);
     }
 
     #[test]
-    fn test_default_contracts_contains_usdc() {
-        let contracts = default_contracts();
+    fn test_default_eth_contracts_contains_usdc() {
+        let contracts = default_eth_contracts();
         let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         assert!(contracts.contains(&usdc));
+    }
+
+    #[test]
+    fn test_default_polygon_contracts_count() {
+        let contracts = default_polygon_contracts();
+        assert_eq!(contracts.len(), 7);
+    }
+
+    #[test]
+    fn test_default_polygon_contracts_contains_usdc_bridged() {
+        let contracts = default_polygon_contracts();
+        let usdc_bridged = address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+        assert!(contracts.contains(&usdc_bridged));
+    }
+
+    #[test]
+    fn test_decode_log_chain_id_137() {
+        use alloy::sol_types::SolEvent;
+
+        let from = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let to = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let value = U256::from(1_000_000u64);
+
+        let log_data = Transfer::encode_log_data(&Transfer { from, to, value });
+
+        let log = mock_log(
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            log_data.topics().to_vec(),
+            log_data.data.to_vec(),
+            50_000_000,
+            2,
+            b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+        );
+
+        let event = decode_log(&log, 137).expect("should decode Transfer with chain_id 137");
+        assert_eq!(event.chain_id, 137);
+        assert_eq!(event.event_type, "Transfer");
     }
 }

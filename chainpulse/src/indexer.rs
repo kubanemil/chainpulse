@@ -5,12 +5,20 @@ use alloy::eips::BlockNumberOrTag;
 use futures_util::StreamExt;
 use sqlx::PgPool;
 use std::time::Duration;
-
-use chainpulse_config::Config;
+use tracing::Instrument;
 
 /// Number of blocks to fetch per `eth_getLogs` chunk during catch-up.
 /// 2,000 is safe for all major RPC providers (Alchemy free tier, Infura, Ankr, public nodes).
 const CATCH_UP_CHUNK_SIZE: u64 = 2_000;
+
+/// Per-chain configuration bundling all parameters needed by the indexer.
+#[derive(Debug, Clone)]
+pub struct ChainConfig {
+    pub name: String,
+    pub chain_id: i32,
+    pub ws_url: String,
+    pub contracts: Vec<Address>,
+}
 
 /// Errors from a single indexer session.
 #[derive(Debug)]
@@ -30,55 +38,59 @@ impl std::fmt::Display for IndexerError {
     }
 }
 
-/// Outer reconnection loop. Never returns. Contains backoff state and calls
+/// Outer reconnection loop. Contains backoff state and calls
 /// `run_session` in a loop, applying exponential backoff on failure.
-pub async fn run_indexer(pool: &PgPool, config: &Config) -> ! {
-    let initial_backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
-    let mut backoff = initial_backoff;
-    let mut retry_count: u32 = 0;
+/// Returns `Result<(), IndexerError>` so it can be spawned as a Tokio task.
+pub async fn run_indexer(pool: PgPool, config: ChainConfig) -> Result<(), IndexerError> {
+    let span = tracing::info_span!("chain", name = %config.name, chain_id = config.chain_id);
 
-    let contracts = chainpulse_types::default_contracts();
-    let chain_id: i32 = 1;
+    async {
+        let initial_backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(60);
+        let mut backoff = initial_backoff;
+        let mut retry_count: u32 = 0;
 
-    loop {
-        // Log reconnect attempt only for actual retries (not the first connection attempt)
-        if retry_count > 0 {
-            tracing::warn!(
-                retry_count = retry_count,
-                backoff_secs = backoff.as_secs(),
-                "Reconnecting..."
-            );
-        }
-
-        match run_session(pool, &config.eth_rpc_ws_url, contracts.clone(), chain_id, retry_count).await {
-            Ok(()) => {
-                // Stream ended normally (WS disconnect) — treat as recoverable
-                tracing::warn!(
-                    retry_count = retry_count,
-                    "WebSocket disconnected, will reconnect"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, max_backoff);
-                retry_count += 1;
-            }
-            Err(IndexerError::Recoverable(msg)) => {
+        loop {
+            // Log reconnect attempt only for actual retries (not the first connection attempt)
+            if retry_count > 0 {
                 tracing::warn!(
                     retry_count = retry_count,
                     backoff_secs = backoff.as_secs(),
-                    error = %msg,
-                    "Reconnection failed"
+                    "Reconnecting..."
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, max_backoff);
-                retry_count += 1;
             }
-            Err(IndexerError::Fatal(msg)) => {
-                tracing::error!(error = %msg, "Fatal error, exiting");
-                std::process::exit(1);
+
+            match run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count).await {
+                Ok(()) => {
+                    // Stream ended normally (WS disconnect) — treat as recoverable
+                    tracing::warn!(
+                        retry_count = retry_count,
+                        "WebSocket disconnected, will reconnect"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    retry_count += 1;
+                }
+                Err(IndexerError::Recoverable(msg)) => {
+                    tracing::warn!(
+                        retry_count = retry_count,
+                        backoff_secs = backoff.as_secs(),
+                        error = %msg,
+                        "Reconnection failed"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    retry_count += 1;
+                }
+                Err(IndexerError::Fatal(msg)) => {
+                    tracing::error!(error = %msg, "Fatal error, exiting");
+                    return Err(IndexerError::Fatal(msg));
+                }
             }
         }
     }
+    .instrument(span)
+    .await
 }
 
 /// Single connection session: connect WS, run catch-up, subscribe to live logs,
@@ -150,7 +162,7 @@ pub async fn run_session(
 
     // Event processing loop
     while let Some(log) = stream.next().await {
-        if let Some(event) = chainpulse_types::decode_log(&log) {
+        if let Some(event) = chainpulse_types::decode_log(&log, chain_id) {
             match chainpulse_db::insert_event(
                 pool,
                 event.chain_id,
@@ -294,7 +306,7 @@ async fn fetch_logs_chunk(
     let mut events_count: u64 = 0;
 
     for log in &logs {
-        if let Some(event) = chainpulse_types::decode_log(log) {
+        if let Some(event) = chainpulse_types::decode_log(log, chain_id) {
             chainpulse_db::insert_event(
                 pool,
                 event.chain_id,
