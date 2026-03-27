@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::api::HealthState;
@@ -28,27 +29,20 @@ pub struct ChainConfig {
 }
 
 /// Errors from a single indexer session.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
     /// Recoverable: WS disconnect, connection failure, subscription failure.
+    #[error("recoverable: {0}")]
     Recoverable(String),
     /// Fatal: DB errors, irrecoverable failures.
+    #[error("fatal: {0}")]
     Fatal(String),
-}
-
-impl std::fmt::Display for IndexerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IndexerError::Recoverable(msg) => write!(f, "recoverable: {msg}"),
-            IndexerError::Fatal(msg) => write!(f, "fatal: {msg}"),
-        }
-    }
 }
 
 /// Outer reconnection loop. Contains backoff state and calls
 /// `run_session` in a loop, applying exponential backoff on failure.
 /// Returns `Result<(), IndexerError>` so it can be spawned as a Tokio task.
-pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<NormalizedEvent>, health_state: HealthState) -> Result<(), IndexerError> {
+pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<NormalizedEvent>, health_state: HealthState, token: CancellationToken) -> Result<(), IndexerError> {
     let span = tracing::info_span!("chain", name = %config.name, chain_id = config.chain_id);
 
     async {
@@ -58,6 +52,12 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<Normalize
         let mut retry_count: u32 = 0;
 
         loop {
+            // Check for cancellation before each session attempt
+            if token.is_cancelled() {
+                tracing::info!("Shutdown requested, stopping indexer");
+                return Ok(());
+            }
+
             // Log reconnect attempt only for actual retries (not the first connection attempt)
             if retry_count > 0 {
                 tracing::warn!(
@@ -67,37 +67,45 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<Normalize
                 );
             }
 
-            match run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count, &tx, &config.name, &health_state).await {
-                Ok(()) => {
-                    // Stream ended normally (WS disconnect) — treat as recoverable
-                    gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
-                    health_state.set_connected(&config.name, false).await;
-                    tracing::warn!(
-                        retry_count = retry_count,
-                        "WebSocket disconnected, will reconnect"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
-                    retry_count += 1;
+            tokio::select! {
+                _ = token.cancelled() => {
+                    tracing::info!("Shutdown requested, stopping indexer");
+                    return Ok(());
                 }
-                Err(IndexerError::Recoverable(msg)) => {
-                    gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
-                    health_state.set_connected(&config.name, false).await;
-                    tracing::warn!(
-                        retry_count = retry_count,
-                        backoff_secs = backoff.as_secs(),
-                        error = %msg,
-                        "Reconnection failed"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
-                    retry_count += 1;
-                }
-                Err(IndexerError::Fatal(msg)) => {
-                    gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
-                    health_state.set_connected(&config.name, false).await;
-                    tracing::error!(error = %msg, "Fatal error, exiting");
-                    return Err(IndexerError::Fatal(msg));
+                result = run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count, &tx, &config.name, &health_state, &token) => {
+                    match result {
+                        Ok(()) => {
+                            // Stream ended normally (WS disconnect) — treat as recoverable
+                            gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
+                            health_state.set_connected(&config.name, false).await;
+                            tracing::warn!(
+                                retry_count = retry_count,
+                                "WebSocket disconnected, will reconnect"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            retry_count += 1;
+                        }
+                        Err(IndexerError::Recoverable(msg)) => {
+                            gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
+                            health_state.set_connected(&config.name, false).await;
+                            tracing::warn!(
+                                retry_count = retry_count,
+                                backoff_secs = backoff.as_secs(),
+                                error = %msg,
+                                "Reconnection failed"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            retry_count += 1;
+                        }
+                        Err(IndexerError::Fatal(msg)) => {
+                            gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
+                            health_state.set_connected(&config.name, false).await;
+                            tracing::error!(error = %msg, "Fatal error, exiting");
+                            return Err(IndexerError::Fatal(msg));
+                        }
+                    }
                 }
             }
         }
@@ -119,6 +127,7 @@ pub async fn run_session(
     tx: &Sender<NormalizedEvent>,
     chain_name: &str,
     health_state: &HealthState,
+    token: &CancellationToken,
 ) -> Result<(), IndexerError> {
     // Connect WebSocket
     let ws = WsConnect::new(ws_url);
@@ -180,24 +189,37 @@ pub async fn run_session(
     );
 
     // Event processing loop -- send events to bounded channel with backpressure detection
-    while let Some(log) = stream.next().await {
-        if let Some(event) = chainpulse_types::decode_log(&log, chain_id) {
-            tracing::info!(
-                event_type = %event.event_type,
-                block_number = event.block_number,
-                contract_address = %event.contract_address,
-                "Sending event to channel"
-            );
-            health_state.set_last_event_at(chain_name, Utc::now()).await;
-            health_state.set_last_block(chain_name, event.block_number).await;
-            backpressure_send(tx, event, chain_id).await?;
-        } else {
-            tracing::debug!("Skipping unknown event");
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                tracing::info!("Shutdown requested, stopping event processing");
+                return Ok(());
+            }
+            log_opt = stream.next() => {
+                match log_opt {
+                    Some(log) => {
+                        if let Some(event) = chainpulse_types::decode_log(&log, chain_id) {
+                            tracing::info!(
+                                event_type = %event.event_type,
+                                block_number = event.block_number,
+                                contract_address = %event.contract_address,
+                                "Sending event to channel"
+                            );
+                            health_state.set_last_event_at(chain_name, Utc::now()).await;
+                            health_state.set_last_block(chain_name, event.block_number).await;
+                            backpressure_send(tx, event, chain_id).await?;
+                        } else {
+                            tracing::debug!("Skipping unknown event");
+                        }
+                    }
+                    None => {
+                        // Stream ended normally (WS disconnected)
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
-
-    // Stream ended normally (WS disconnected)
-    Ok(())
 }
 
 /// Detect the gap between `last_indexed_block` and the current chain head,

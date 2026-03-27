@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -43,6 +45,10 @@ fn default_ws_max_connections() -> usize {
     100
 }
 
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub database_url: String,
@@ -75,6 +81,9 @@ pub struct Config {
 
     #[serde(default = "default_ws_max_connections")]
     pub ws_max_connections: usize,
+
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
 }
 
 impl Config {

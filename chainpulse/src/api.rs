@@ -465,6 +465,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -763,6 +764,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     host: String,
     port: u16,
@@ -771,11 +773,17 @@ pub async fn start_server(
     ws_max_connections: usize,
     prometheus_handle: PrometheusHandle,
     health_state: HealthState,
+    token: tokio_util::sync::CancellationToken,
 ) -> Result<(), std::io::Error> {
     let router = create_router(pool, event_tx, ws_max_connections, prometheus_handle, health_state);
     let addr = format!("{host}:{port}");
     tracing::info!(address = %addr, "Starting API server");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            token.cancelled().await;
+            tracing::info!("API server: graceful shutdown initiated");
+        })
+        .await?;
     Ok(())
 }

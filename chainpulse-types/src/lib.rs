@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use serde::{Deserialize, Serialize};
@@ -285,6 +287,7 @@ pub fn default_polygon_contracts() -> Vec<alloy::primitives::Address> {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use alloy::primitives::{address, b256, Address, B256, LogData, U256};

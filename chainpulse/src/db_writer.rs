@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{interval, Interval};
+use tokio_util::sync::CancellationToken;
 
 use crate::indexer::IndexerError;
 
@@ -43,6 +44,7 @@ pub async fn run(
     batch_size: usize,
     flush_interval_ms: u64,
     event_tx: broadcast::Sender<NormalizedEvent>,
+    token: CancellationToken,
 ) -> Result<(), IndexerError> {
     tracing::info!(
         batch_size = batch_size,
@@ -60,6 +62,25 @@ pub async fn run(
             // Bias towards receiving events to keep the buffer filling efficiently.
             // The timer branch will still fire when the receive is idle.
             biased;
+
+            _ = token.cancelled() => {
+                // Drain remaining events from the channel
+                let mut drained: usize = 0;
+                while let Ok(event) = rx.try_recv() {
+                    buffer.push(event);
+                    drained += 1;
+                }
+                tracing::info!(
+                    drained = drained,
+                    buffered = buffer.len(),
+                    "DB writer: shutdown requested, draining channel"
+                );
+                if !buffer.is_empty() {
+                    flush_batch(&pool, &mut buffer, "shutdown", &event_tx).await?;
+                }
+                tracing::info!("DB writer: shutdown complete");
+                return Ok(());
+            }
 
             event = rx.recv() => {
                 match event {

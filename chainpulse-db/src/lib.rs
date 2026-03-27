@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use chainpulse_types::NormalizedEvent;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
