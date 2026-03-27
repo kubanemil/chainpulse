@@ -35,6 +35,14 @@ fn default_flush_interval_ms() -> u64 {
     500
 }
 
+fn default_ws_broadcast_capacity() -> usize {
+    1024
+}
+
+fn default_ws_max_connections() -> usize {
+    100
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub database_url: String,
@@ -61,6 +69,12 @@ pub struct Config {
 
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
+
+    #[serde(default = "default_ws_broadcast_capacity")]
+    pub ws_broadcast_capacity: usize,
+
+    #[serde(default = "default_ws_max_connections")]
+    pub ws_max_connections: usize,
 }
 
 impl Config {

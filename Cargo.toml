@@ -20,4 +20,4 @@ thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 alloy = { version = "1", features = ["provider-ws", "pubsub", "rpc-types"] }
 futures-util = "0.3"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }

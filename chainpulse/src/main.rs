@@ -64,10 +64,17 @@ async fn main() {
         config.channel_buffer_size,
     );
 
+    // Create broadcast channel for WebSocket event streaming
+    let (broadcast_tx, _broadcast_rx) =
+        tokio::sync::broadcast::channel::<chainpulse_types::NormalizedEvent>(
+            config.ws_broadcast_capacity,
+        );
+
     tracing::info!(
         channel_buffer_size = config.channel_buffer_size,
         batch_size = config.batch_size,
         flush_interval_ms = config.flush_interval_ms,
+        ws_broadcast_capacity = config.ws_broadcast_capacity,
         "Bounded channel created"
     );
 
@@ -77,6 +84,7 @@ async fn main() {
         pool.clone(),
         config.batch_size,
         config.flush_interval_ms,
+        broadcast_tx.clone(),
     ));
 
     // Spawn the API server task (read-only access to the database)
@@ -84,6 +92,8 @@ async fn main() {
         config.server_host.clone(),
         config.server_port,
         pool.clone(),
+        broadcast_tx,
+        config.ws_max_connections,
     ));
 
     // Spawn one indexer task per chain

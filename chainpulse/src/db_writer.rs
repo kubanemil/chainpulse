@@ -1,6 +1,7 @@
 use chainpulse_types::NormalizedEvent;
 use sqlx::PgPool;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{interval, Interval};
 
@@ -30,6 +31,7 @@ pub async fn run(
     pool: PgPool,
     batch_size: usize,
     flush_interval_ms: u64,
+    event_tx: broadcast::Sender<NormalizedEvent>,
 ) -> Result<(), IndexerError> {
     tracing::info!(
         batch_size = batch_size,
@@ -53,14 +55,14 @@ pub async fn run(
                     Some(event) => {
                         buffer.push(event);
                         if buffer.len() >= batch_size {
-                            flush_batch(&pool, &mut buffer, "size_threshold").await?;
+                            flush_batch(&pool, &mut buffer, "size_threshold", &event_tx).await?;
                             flush_timer.reset();
                         }
                     }
                     None => {
                         // All senders dropped -- flush remaining events and exit.
                         if !buffer.is_empty() {
-                            flush_batch(&pool, &mut buffer, "shutdown").await?;
+                            flush_batch(&pool, &mut buffer, "shutdown", &event_tx).await?;
                         }
                         tracing::info!("DB writer: all senders dropped, shutting down");
                         return Ok(());
@@ -70,7 +72,7 @@ pub async fn run(
 
             _ = flush_timer.tick() => {
                 if !buffer.is_empty() {
-                    flush_batch(&pool, &mut buffer, "timer").await?;
+                    flush_batch(&pool, &mut buffer, "timer", &event_tx).await?;
                 }
             }
         }
@@ -83,6 +85,7 @@ async fn flush_batch(
     pool: &PgPool,
     buffer: &mut Vec<NormalizedEvent>,
     trigger: &str,
+    event_tx: &broadcast::Sender<NormalizedEvent>,
 ) -> Result<(), IndexerError> {
     let event_count = buffer.len();
     let start = std::time::Instant::now();
@@ -116,6 +119,10 @@ async fn flush_batch(
                     "Batch flushed: {} events",
                     event_count,
                 );
+                // Publish events to broadcast channel before clearing buffer
+                for event in buffer.iter() {
+                    let _ = event_tx.send(event.clone());
+                }
                 buffer.clear();
                 return Ok(());
             }
