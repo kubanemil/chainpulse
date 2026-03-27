@@ -1,11 +1,22 @@
 use chainpulse_types::NormalizedEvent;
+use metrics::{counter, gauge, histogram};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{interval, Interval};
 
 use crate::indexer::IndexerError;
+
+/// Map a chain_id to a human-readable chain name for metric labels.
+fn chain_name(chain_id: i32) -> &'static str {
+    match chain_id {
+        1 => "ethereum",
+        137 => "polygon",
+        _ => "unknown",
+    }
+}
 
 /// Maximum number of retry attempts for a failed batch flush before giving up.
 const MAX_FLUSH_RETRIES: u32 = 3;
@@ -110,7 +121,45 @@ async fn flush_batch(
                     )));
                 }
 
-                let duration_ms = start.elapsed().as_millis();
+                let duration = start.elapsed();
+                let duration_ms = duration.as_millis();
+
+                // Record DB write duration histogram
+                histogram!("chainpulse_db_write_duration_seconds", "trigger" => trigger.to_string())
+                    .record(duration.as_secs_f64());
+
+                // Increment events_processed_total counter per chain and event_type
+                let mut events_by_key: HashMap<(i32, &str), u64> = HashMap::new();
+                for event in buffer.iter() {
+                    *events_by_key
+                        .entry((event.chain_id, event.event_type.as_str()))
+                        .or_default() += 1;
+                }
+                for ((chain_id, event_type), count) in &events_by_key {
+                    counter!(
+                        "chainpulse_events_processed_total",
+                        "chain" => chain_name(*chain_id).to_string(),
+                        "event_type" => event_type.to_string(),
+                    )
+                    .increment(*count);
+                }
+
+                // Set last_indexed_block gauge per chain
+                let mut chain_max_blocks: HashMap<i32, i64> = HashMap::new();
+                for event in buffer.iter() {
+                    let entry = chain_max_blocks.entry(event.chain_id).or_insert(event.block_number);
+                    if event.block_number > *entry {
+                        *entry = event.block_number;
+                    }
+                }
+                for (chain_id, block_number) in &chain_max_blocks {
+                    gauge!(
+                        "chainpulse_last_indexed_block",
+                        "chain" => chain_name(*chain_id).to_string(),
+                    )
+                    .set(*block_number as f64);
+                }
+
                 tracing::info!(
                     events_flushed = event_count,
                     rows_inserted = rows_inserted,

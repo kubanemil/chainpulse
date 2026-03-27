@@ -3,12 +3,16 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use alloy::eips::BlockNumberOrTag;
 use chainpulse_types::NormalizedEvent;
+use chrono::Utc;
 use futures_util::StreamExt;
+use metrics::gauge;
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::Instrument;
+
+use crate::api::HealthState;
 
 /// Number of blocks to fetch per `eth_getLogs` chunk during catch-up.
 /// 2,000 is safe for all major RPC providers (Alchemy free tier, Infura, Ankr, public nodes).
@@ -44,7 +48,7 @@ impl std::fmt::Display for IndexerError {
 /// Outer reconnection loop. Contains backoff state and calls
 /// `run_session` in a loop, applying exponential backoff on failure.
 /// Returns `Result<(), IndexerError>` so it can be spawned as a Tokio task.
-pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<NormalizedEvent>) -> Result<(), IndexerError> {
+pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<NormalizedEvent>, health_state: HealthState) -> Result<(), IndexerError> {
     let span = tracing::info_span!("chain", name = %config.name, chain_id = config.chain_id);
 
     async {
@@ -63,9 +67,11 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<Normalize
                 );
             }
 
-            match run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count, &tx).await {
+            match run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count, &tx, &config.name, &health_state).await {
                 Ok(()) => {
                     // Stream ended normally (WS disconnect) — treat as recoverable
+                    gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
+                    health_state.set_connected(&config.name, false).await;
                     tracing::warn!(
                         retry_count = retry_count,
                         "WebSocket disconnected, will reconnect"
@@ -75,6 +81,8 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<Normalize
                     retry_count += 1;
                 }
                 Err(IndexerError::Recoverable(msg)) => {
+                    gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
+                    health_state.set_connected(&config.name, false).await;
                     tracing::warn!(
                         retry_count = retry_count,
                         backoff_secs = backoff.as_secs(),
@@ -86,6 +94,8 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<Normalize
                     retry_count += 1;
                 }
                 Err(IndexerError::Fatal(msg)) => {
+                    gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
+                    health_state.set_connected(&config.name, false).await;
                     tracing::error!(error = %msg, "Fatal error, exiting");
                     return Err(IndexerError::Fatal(msg));
                 }
@@ -99,6 +109,7 @@ pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<Normalize
 /// Single connection session: connect WS, run catch-up, subscribe to live logs,
 /// and process events until stream ends. Returns `Ok(())` when stream ends
 /// (triggering reconnect) or `Err` on error.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_session(
     pool: &PgPool,
     ws_url: &str,
@@ -106,6 +117,8 @@ pub async fn run_session(
     chain_id: i32,
     retry_count: u32,
     tx: &Sender<NormalizedEvent>,
+    chain_name: &str,
+    health_state: &HealthState,
 ) -> Result<(), IndexerError> {
     // Connect WebSocket
     let ws = WsConnect::new(ws_url);
@@ -114,6 +127,8 @@ pub async fn run_session(
         .await
         .map_err(|e| IndexerError::Recoverable(format!("WebSocket connect failed: {e}")))?;
 
+    gauge!("chainpulse_ws_connected", "chain" => chain_name.to_string()).set(1.0);
+    health_state.set_connected(chain_name, true).await;
     tracing::info!(ws_url = %ws_url, "WebSocket connected");
 
     // Log successful reconnect when this is a retry (not the initial connection)
@@ -173,6 +188,8 @@ pub async fn run_session(
                 contract_address = %event.contract_address,
                 "Sending event to channel"
             );
+            health_state.set_last_event_at(chain_name, Utc::now()).await;
+            health_state.set_last_block(chain_name, event.block_number).await;
             backpressure_send(tx, event, chain_id).await?;
         } else {
             tracing::debug!("Skipping unknown event");
@@ -310,6 +327,14 @@ async fn backpressure_send(
     event: NormalizedEvent,
     chain_id: i32,
 ) -> Result<(), IndexerError> {
+    // Record channel utilization: (max_capacity - available_capacity) / max_capacity
+    let max_cap = tx.max_capacity();
+    let cap = tx.capacity();
+    if max_cap > 0 {
+        let utilization = (max_cap - cap) as f64 / max_cap as f64;
+        gauge!("chainpulse_channel_utilization").set(utilization);
+    }
+
     match tx.try_send(event) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(event)) => {

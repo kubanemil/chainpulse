@@ -22,6 +22,11 @@ async fn main() {
         .json()
         .init();
 
+    // Install Prometheus metrics recorder before any metrics macros are used
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
     tracing::info!(
         server_host = %config.server_host,
         server_port = config.server_port,
@@ -59,6 +64,11 @@ async fn main() {
         },
     ];
 
+    // Create shared health state from chain configs
+    let health_state = api::HealthState::new(
+        chain_configs.iter().map(|c| (c.name.clone(), c.chain_id)).collect(),
+    );
+
     // Create bounded MPSC channel for backpressure between indexers and DB writer
     let (tx, rx) = tokio::sync::mpsc::channel::<chainpulse_types::NormalizedEvent>(
         config.channel_buffer_size,
@@ -94,6 +104,8 @@ async fn main() {
         pool.clone(),
         broadcast_tx,
         config.ws_max_connections,
+        prometheus_handle,
+        health_state.clone(),
     ));
 
     // Spawn one indexer task per chain
@@ -107,7 +119,8 @@ async fn main() {
         );
         let pool_clone = pool.clone();
         let tx_clone = tx.clone();
-        let handle = tokio::spawn(indexer::run_indexer(pool_clone, chain_config, tx_clone));
+        let health_clone = health_state.clone();
+        let handle = tokio::spawn(indexer::run_indexer(pool_clone, chain_config, tx_clone, health_clone));
         handles.push(handle);
     }
 

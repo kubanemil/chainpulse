@@ -10,12 +10,81 @@ use axum::{
 };
 use chainpulse_db::{EventFilter, EventRow};
 use chainpulse_types::NormalizedEvent;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, RwLock};
+
+/// Per-chain health status.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainHealth {
+    pub chain_name: String,
+    pub chain_id: i32,
+    pub connected: bool,
+    pub last_block_number: Option<i64>,
+    pub last_event_at: Option<DateTime<Utc>>,
+}
+
+/// Top-level health response returned by the `/health` endpoint.
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub chains: Vec<ChainHealth>,
+}
+
+/// Shared health state tracking per-chain subscriber status.
+#[derive(Clone)]
+pub struct HealthState {
+    inner: Arc<RwLock<HashMap<String, ChainHealth>>>,
+}
+
+impl HealthState {
+    /// Create a new HealthState initialized with all chains as disconnected.
+    pub fn new(chains: Vec<(String, i32)>) -> Self {
+        let mut map = HashMap::new();
+        for (name, chain_id) in chains {
+            map.insert(
+                name.clone(),
+                ChainHealth {
+                    chain_name: name,
+                    chain_id,
+                    connected: false,
+                    last_block_number: None,
+                    last_event_at: None,
+                },
+            );
+        }
+        Self {
+            inner: Arc::new(RwLock::new(map)),
+        }
+    }
+
+    /// Update the connection status for a chain.
+    pub async fn set_connected(&self, chain: &str, connected: bool) {
+        if let Some(health) = self.inner.write().await.get_mut(chain) {
+            health.connected = connected;
+        }
+    }
+
+    /// Update the last indexed block number for a chain.
+    pub async fn set_last_block(&self, chain: &str, block: i64) {
+        if let Some(health) = self.inner.write().await.get_mut(chain) {
+            health.last_block_number = Some(block);
+        }
+    }
+
+    /// Update the last event timestamp for a chain.
+    pub async fn set_last_event_at(&self, chain: &str, ts: DateTime<Utc>) {
+        if let Some(health) = self.inner.write().await.get_mut(chain) {
+            health.last_event_at = Some(ts);
+        }
+    }
+}
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 1000;
@@ -27,6 +96,8 @@ struct AppState {
     event_tx: broadcast::Sender<NormalizedEvent>,
     ws_connection_count: Arc<AtomicUsize>,
     ws_max_connections: usize,
+    prometheus_handle: PrometheusHandle,
+    health_state: HealthState,
 }
 
 /// Guard that decrements the WebSocket connection counter when dropped.
@@ -142,18 +213,44 @@ impl From<chainpulse_db::DbError> for ApiError {
     }
 }
 
-pub fn create_router(pool: PgPool, event_tx: broadcast::Sender<NormalizedEvent>, ws_max_connections: usize) -> Router {
+pub fn create_router(
+    pool: PgPool,
+    event_tx: broadcast::Sender<NormalizedEvent>,
+    ws_max_connections: usize,
+    prometheus_handle: PrometheusHandle,
+    health_state: HealthState,
+) -> Router {
     let state = AppState {
         pool,
         event_tx,
         ws_connection_count: Arc::new(AtomicUsize::new(0)),
         ws_max_connections,
+        prometheus_handle,
+        health_state,
     };
     Router::new()
         .route("/events", get(list_events))
         .route("/events/{id}", get(get_event))
         .route("/ws/events", get(ws_events))
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler))
         .with_state(state)
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> String {
+    state.prometheus_handle.render()
+}
+
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    let map = state.health_state.inner.read().await;
+    let chains: Vec<ChainHealth> = map.values().cloned().collect();
+    let all_connected = chains.iter().all(|c| c.connected);
+    let status = if all_connected {
+        "healthy".to_string()
+    } else {
+        "degraded".to_string()
+    };
+    Json(HealthResponse { status, chains })
 }
 
 async fn list_events(
@@ -569,6 +666,101 @@ mod tests {
         // After guard is dropped, counter should be decremented
         assert_eq!(counter.load(Ordering::SeqCst), 4);
     }
+
+    #[tokio::test]
+    async fn test_health_state_new_initializes_disconnected() {
+        let state = HealthState::new(vec![
+            ("ethereum".to_string(), 1),
+            ("polygon".to_string(), 137),
+        ]);
+        let map = state.inner.read().await;
+        assert_eq!(map.len(), 2);
+
+        let eth = map.get("ethereum").unwrap();
+        assert_eq!(eth.chain_name, "ethereum");
+        assert_eq!(eth.chain_id, 1);
+        assert!(!eth.connected);
+        assert!(eth.last_block_number.is_none());
+        assert!(eth.last_event_at.is_none());
+
+        let poly = map.get("polygon").unwrap();
+        assert_eq!(poly.chain_name, "polygon");
+        assert_eq!(poly.chain_id, 137);
+        assert!(!poly.connected);
+    }
+
+    #[tokio::test]
+    async fn test_health_state_set_connected() {
+        let state = HealthState::new(vec![("ethereum".to_string(), 1)]);
+        state.set_connected("ethereum", true).await;
+        {
+            let map = state.inner.read().await;
+            assert!(map.get("ethereum").unwrap().connected);
+        }
+        state.set_connected("ethereum", false).await;
+        {
+            let map = state.inner.read().await;
+            assert!(!map.get("ethereum").unwrap().connected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_state_set_last_block() {
+        let state = HealthState::new(vec![("ethereum".to_string(), 1)]);
+        state.set_last_block("ethereum", 18_000_000).await;
+        let map = state.inner.read().await;
+        assert_eq!(map.get("ethereum").unwrap().last_block_number, Some(18_000_000));
+    }
+
+    #[tokio::test]
+    async fn test_health_state_set_last_event_at() {
+        let state = HealthState::new(vec![("ethereum".to_string(), 1)]);
+        let now = Utc::now();
+        state.set_last_event_at("ethereum", now).await;
+        let map = state.inner.read().await;
+        assert_eq!(map.get("ethereum").unwrap().last_event_at, Some(now));
+    }
+
+    #[tokio::test]
+    async fn test_health_state_unknown_chain_ignored() {
+        let state = HealthState::new(vec![("ethereum".to_string(), 1)]);
+        // These should not panic or create new entries
+        state.set_connected("unknown", true).await;
+        state.set_last_block("unknown", 100).await;
+        state.set_last_event_at("unknown", Utc::now()).await;
+        let map = state.inner.read().await;
+        assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_health_response_healthy_when_all_connected() {
+        let state = HealthState::new(vec![
+            ("ethereum".to_string(), 1),
+            ("polygon".to_string(), 137),
+        ]);
+        state.set_connected("ethereum", true).await;
+        state.set_connected("polygon", true).await;
+
+        let map = state.inner.read().await;
+        let chains: Vec<ChainHealth> = map.values().cloned().collect();
+        let all_connected = chains.iter().all(|c| c.connected);
+        assert!(all_connected);
+    }
+
+    #[tokio::test]
+    async fn test_health_response_degraded_when_partial() {
+        let state = HealthState::new(vec![
+            ("ethereum".to_string(), 1),
+            ("polygon".to_string(), 137),
+        ]);
+        state.set_connected("ethereum", true).await;
+        // polygon remains disconnected
+
+        let map = state.inner.read().await;
+        let chains: Vec<ChainHealth> = map.values().cloned().collect();
+        let all_connected = chains.iter().all(|c| c.connected);
+        assert!(!all_connected);
+    }
 }
 
 pub async fn start_server(
@@ -577,8 +769,10 @@ pub async fn start_server(
     pool: PgPool,
     event_tx: broadcast::Sender<NormalizedEvent>,
     ws_max_connections: usize,
+    prometheus_handle: PrometheusHandle,
+    health_state: HealthState,
 ) -> Result<(), std::io::Error> {
-    let router = create_router(pool, event_tx, ws_max_connections);
+    let router = create_router(pool, event_tx, ws_max_connections, prometheus_handle, health_state);
     let addr = format!("{host}:{port}");
     tracing::info!(address = %addr, "Starting API server");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
