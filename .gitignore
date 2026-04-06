@@ -4,3 +4,5 @@
 *.swo
 .DS_Store
 .pipeline/
+.claude/
+docs/dev/
