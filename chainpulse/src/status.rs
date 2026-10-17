@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::watch;
 
-/// What an indexer last saw, published for `/ready`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Progress {
     pub head: Option<u64>,

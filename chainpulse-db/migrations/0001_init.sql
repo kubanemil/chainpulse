@@ -1,4 +1,3 @@
--- One row per chain. Moves forward on commit and back only on a reorg rollback.
 CREATE TABLE chain_cursors (
     chain_id        BIGINT PRIMARY KEY,
     block_number    BIGINT NOT NULL,

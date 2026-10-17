@@ -3,6 +3,7 @@
 
 mod common;
 
+use chainpulse::indexer::Step;
 use chainpulse_db::PgPool;
 use common::{Chain, migrated, sync};
 
@@ -20,6 +21,19 @@ async fn reports_lag_reorgs_and_rollback_depth(pool: PgPool) {
 
     chain.revert(snapshot).await;
     chain.mine(3).await;
+    let step = indexer.step().await.expect("step");
+    assert!(matches!(step, Step::RolledBack { to: 1, .. }), "{step:?}");
+    let after_rollback = metrics.render();
+    for line in [
+        "chainpulse_indexed_block{chain=\"anvil\"} 1",
+        "chainpulse_lag_blocks{chain=\"anvil\"} 3",
+    ] {
+        assert!(
+            after_rollback.contains(line),
+            "missing `{line}` in:\n{after_rollback}"
+        );
+    }
+
     sync(&mut indexer).await;
     let rendered = metrics.render();
 

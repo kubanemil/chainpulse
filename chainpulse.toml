@@ -3,7 +3,7 @@
 
 [database]
 url = "postgres://chainpulse:chainpulse@localhost:5432/chainpulse"
-max_connections = 10
+max_connections = 10   # API pool; each indexer has its own connection
 
 [api]
 listen = "0.0.0.0:8080"

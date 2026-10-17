@@ -50,7 +50,6 @@ async fn get(address: &str, path: &str) -> (u16, Value) {
     )
 }
 
-/// Indexes a mint plus four transfers and serves the API over them.
 async fn indexed_chain(pool: &PgPool) -> (Chain, String) {
     migrated(pool).await;
     let chain = Chain::start().await;
@@ -131,6 +130,19 @@ async fn serves_single_events_and_rejects_bad_requests(pool: PgPool) {
     assert_eq!(get(&address, "/events?event_type=Mint").await.0, 400);
     assert_eq!(get(&address, "/events?limit=many").await.0, 400);
     assert_eq!(get(&address, "/events?offset=10").await.0, 400);
+    assert_eq!(
+        get(&address, "/events?chain_id=18446744073709551615").await,
+        (
+            400,
+            json!({ "error": "chain_id is larger than 9223372036854775807" })
+        )
+    );
+    assert_eq!(
+        get(&address, "/events?from_block=9223372036854775808")
+            .await
+            .0,
+        400
+    );
 }
 
 #[sqlx::test(migrations = false)]

@@ -45,16 +45,20 @@ same loop, so there is no handoff to get wrong.
   +-----------------------------------+
 ```
 
-Each chain runs in its own task. If any task fails for good, the process stops all of them and
-exits non-zero, so a supervisor restarts it. On SIGTERM the indexers stop, a step cut short rolls
-back its transaction, and the API drains.
+Each chain runs in its own task with its own database connection, apart from the API's pool, so
+slow queries cannot stall indexing. Node errors, timeouts and lost database connections are retried
+with backoff, and a WebSocket client that stops reconnecting is rebuilt. If any task fails for good,
+the process stops all of them and exits non-zero, so a supervisor restarts it. On SIGTERM the
+indexers stop, a step cut short rolls back its transaction, and the API drains.
 
 ## How reorgs are handled
 
 Every step asks the node for its head and picks the next range:
 
-- Final blocks, at or below `head - confirmations`, come from one `eth_getLogs` over the range. The indexer fetches headers only for the first block, the last block and blocks that
-  have logs, and checks each log's block hash against its header.
+- Final blocks, at or below `head - confirmations`, come from one `eth_getLogs` over the range.
+  The indexer fetches the headers of the first and last block to link the cursor. Timestamps come
+  from the logs when the node includes `blockTimestamp`; otherwise from the headers of blocks with
+  logs. All logs of one block must carry the same block hash, and the header's hash when fetched.
 - Unconfirmed blocks, above `head - confirmations`, are fetched header by header. Each
   must name the previous one as its parent. Logs come per block through `eth_getLogs` with a
   `blockHash` filter, so they belong to exactly the header that was checked.
@@ -116,7 +120,7 @@ GET /events/{id}
 GET /ws/events       send {"subscribe": {"chain_id": 1, "event_type": "Transfer"}}
 GET /health          the process is up
 GET /ready           200 when Postgres answers and every chain is within max_lag_blocks
-GET /metrics         Prometheus: head, indexed block, lag, reorgs, reorg depth, events, RPC errors
+GET /metrics         Prometheus: head, indexed block, lag, reorgs, reorg depth, events, step errors
 ```
 
 A page returns `next_cursor`; pass it back as `cursor` for the next, older page. WebSocket clients
@@ -132,6 +136,7 @@ which means every event above `common_ancestor` on that chain is gone.
 ```toml
 [database]
 url = "postgres://chainpulse:chainpulse@localhost:5432/chainpulse"
+max_connections = 10               # API pool; each indexer has its own connection
 
 [api]
 listen = "0.0.0.0:8080"
@@ -144,7 +149,8 @@ rpc_url = "https://eth.drpc.org"   # http(s):// or ws(s)://
 confirmations = 64                 # deeper blocks are final
 start_block = 21000000             # omit to start at the head
 poll_interval_ms = 2000
-max_block_range = 500              # per eth_getLogs call; halves while the node refuses
+rpc_timeout_ms = 30000             # per request; a timeout is retried
+max_block_range = 500              # per eth_getLogs call; halves while the node rejects the size
 max_lag_blocks = 5                 # /ready fails above this
 
 [[chains.contracts]]
@@ -173,11 +179,11 @@ but some free endpoints refuse it or cap the number of addresses per call.
 | --- | --- | --- |
 | Poll the head, fetch by block | `eth_subscribe("logs")` | Nodes ignore `fromBlock` on a subscription, so events between the backfill and the subscribe are lost. A log feed also never reports empty blocks, so the cursor cannot advance or check hashes. Polling is one loop for backfill and live and works over HTTP. |
 | Logs by `blockHash` near the head | One range query for the window | A range query can answer from a different fork than the headers fetched a moment earlier. A `blockHash` filter ties the logs to the header that was linked. |
-| Range queries for final blocks | Per-block calls everywhere | Backfill would need a call per block. Final blocks are not expected to change, and log hashes are still checked against headers. |
+| Range queries for final blocks | Per-block calls everywhere | Backfill would need a call per block. Final blocks are not expected to change, and logs still have to agree on each block's hash. |
 | Each indexer writes its own steps | A shared writer fed by a channel | The cursor has to commit with its events. A channel in between splits them across transactions and needs its own back-pressure. Waiting on Postgres is the back-pressure. |
 | Cursor moved by compare-and-set | `GREATEST` upsert | The cursor must move back on a reorg, which `GREATEST` refuses. Compare-and-set allows that and makes a second indexer on the same chain fail instead of interleaving writes. |
 | Stop on a reorg deeper than `confirmations` | Roll back as far as needed | Those block hashes are pruned and their events were served as confirmed. Stopping surfaces the broken assumption. |
-| Retry node errors, exit on database errors | Retry everything | RPC providers flake and recover. A broken database needs an operator, and restarts are safe because they resume from the committed cursor. |
+| Retry node and connection errors, exit on data errors | Retry everything | Providers flake and databases restart, and both recover. A cursor conflict or bad data needs an operator, and restarts are safe because they resume from the committed cursor. |
 | `confirmed` derived from the cursor row | A flag rewritten on each event | One row update per step instead of rewriting old events as the chain grows. |
 | Keyset pages on `id` | `LIMIT`/`OFFSET` with a total | Offsets shift while events arrive, and `COUNT(*)` slows down as the table grows. |
 | TOML with env overrides | Env vars only | Chains and contracts are nested lists. Only secrets come from the environment. |

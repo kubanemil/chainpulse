@@ -1,18 +1,16 @@
-//! Pure decisions about chain shape: what to fetch next, whether new blocks build on what is
-//! stored, and where two forks meet.
-
 use chainpulse_types::primitives::B256;
 use chainpulse_types::{Block, BlockRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
-    /// Nothing new. Check that the stored block at this height is still canonical.
     Verify(u64),
-    /// The chain has not reached the configured start block yet.
     Wait,
-    /// Index `from..=to`. Dense ranges lie inside the confirmation depth, so every header is
-    /// fetched and linked; sparse ranges are final and only need the headers that carry logs.
-    Fetch { from: u64, to: u64, dense: bool },
+    /// `dense` ranges lie within the confirmation depth, so every header is fetched and linked.
+    Fetch {
+        from: u64,
+        to: u64,
+        dense: bool,
+    },
 }
 
 pub fn plan(
@@ -49,13 +47,12 @@ pub fn plan(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Broken {
-    /// The first new block does not build on the cursor: the cursor was reorged out.
     Cursor,
-    /// Two adjacent fetched blocks are from different forks: the node switched forks mid-fetch.
+    /// The node switched forks between two fetches.
     Within(u64),
 }
 
-/// Checks that `blocks` (ascending) extend `cursor` and each other wherever heights are adjacent.
+/// `blocks` must be ascending; only adjacent heights can be linked.
 pub fn check_links(cursor: Option<BlockRef>, blocks: &[Block]) -> Result<(), Broken> {
     if let (Some(cursor), Some(first)) = (cursor, blocks.first())
         && first.number == cursor.number + 1
@@ -74,8 +71,7 @@ pub fn check_links(cursor: Option<BlockRef>, blocks: &[Block]) -> Result<(), Bro
     Ok(())
 }
 
-/// `stored` is newest first and `canonical[i]` is the node's hash at `stored[i].number`, if it
-/// has that block. The newest stored block the node still agrees with is the common ancestor.
+/// `stored` is newest first; `canonical[i]` is the node's hash at `stored[i].number`, if any.
 pub fn common_ancestor(stored: &[BlockRef], canonical: &[Option<B256>]) -> Option<BlockRef> {
     stored
         .iter()

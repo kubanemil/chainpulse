@@ -73,6 +73,7 @@ pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()
 
 #[derive(Debug)]
 pub enum ApiError {
+    BadRequest(String),
     NotFound,
     Unavailable(&'static str),
     Internal,
@@ -81,9 +82,13 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::NotFound => (StatusCode::NOT_FOUND, "not found"),
-            Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
-            Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
+            Self::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message.to_owned()),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_owned(),
+            ),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }
@@ -112,7 +117,6 @@ struct ListParams {
 #[derive(Debug, Serialize)]
 struct EventPage {
     events: Vec<EventRecord>,
-    /// Pass back as `cursor` for the next, older page. Absent on the last page.
     next_cursor: Option<i64>,
 }
 
@@ -122,11 +126,11 @@ async fn list_events(
 ) -> Result<Json<EventPage>, ApiError> {
     let limit = params.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     let query = EventQuery {
-        chain_id: params.chain_id,
+        chain_id: signed("chain_id", params.chain_id)?,
         event_type: params.event_type,
         contract: params.contract,
-        from_block: params.from_block,
-        to_block: params.to_block,
+        from_block: signed("from_block", params.from_block)?,
+        to_block: signed("to_block", params.to_block)?,
         confirmed: params.confirmed,
         before_id: params.cursor,
         limit: limit + 1,
@@ -142,6 +146,15 @@ async fn list_events(
         events,
         next_cursor,
     }))
+}
+
+fn signed(name: &str, value: Option<u64>) -> Result<Option<i64>, ApiError> {
+    value
+        .map(|value| {
+            i64::try_from(value)
+                .map_err(|_| ApiError::BadRequest(format!("{name} is larger than {}", i64::MAX)))
+        })
+        .transpose()
 }
 
 async fn get_event(
@@ -165,7 +178,6 @@ struct Readiness {
     chains: Vec<ChainReport>,
 }
 
-/// Ready when Postgres answers and every chain is polling and within its lag limit.
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Readiness>) {
     let database = matches!(
         tokio::time::timeout(DB_PING_TIMEOUT, db::ping(&state.pool)).await,

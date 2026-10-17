@@ -35,6 +35,7 @@ pub struct Config {
 pub struct DatabaseConfig {
     #[serde(default)]
     pub url: String,
+    /// Pool for API queries. Each indexer has its own connection.
     #[serde(default = "defaults::max_connections")]
     pub max_connections: u32,
 }
@@ -55,15 +56,16 @@ pub struct ChainConfig {
     pub name: String,
     #[serde(default)]
     pub rpc_url: String,
-    /// Blocks deeper than this below the head are final. A reorg deeper than this stops the indexer.
+    /// A reorg deeper than this stops the indexer.
     pub confirmations: u64,
-    /// First block to index on a fresh database. The chain head when unset.
+    /// Unset starts a fresh database at the chain head.
     pub start_block: Option<u64>,
     #[serde(default = "defaults::poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default = "defaults::rpc_timeout_ms")]
+    pub rpc_timeout_ms: u64,
     #[serde(default = "defaults::max_block_range")]
     pub max_block_range: u64,
-    /// `/ready` fails while the indexer is more than this many blocks behind the head.
     #[serde(default = "defaults::max_lag_blocks")]
     pub max_lag_blocks: u64,
     pub contracts: Vec<ContractConfig>,
@@ -91,6 +93,9 @@ mod defaults {
     }
     pub fn poll_interval_ms() -> u64 {
         2_000
+    }
+    pub fn rpc_timeout_ms() -> u64 {
+        30_000
     }
     pub fn max_block_range() -> u64 {
         1_000
@@ -123,7 +128,10 @@ impl ChainConfig {
         Duration::from_millis(self.poll_interval_ms)
     }
 
-    /// Env var that overrides `rpc_url`, so API keys stay out of the config file.
+    pub fn rpc_timeout(&self) -> Duration {
+        Duration::from_millis(self.rpc_timeout_ms)
+    }
+
     pub fn rpc_url_env(&self) -> String {
         format!("{}_RPC_URL", self.name.to_uppercase())
     }
@@ -200,6 +208,9 @@ impl Config {
             if chain.poll_interval_ms == 0 {
                 problems.push(format!("{at}: poll_interval_ms must be at least 1"));
             }
+            if chain.rpc_timeout_ms == 0 {
+                problems.push(format!("{at}: rpc_timeout_ms must be at least 1"));
+            }
             if chain.max_block_range == 0 {
                 problems.push(format!("{at}: max_block_range must be at least 1"));
             }
@@ -268,6 +279,7 @@ mod tests {
 
         let chain = &config.chains[0];
         assert_eq!(chain.poll_interval(), Duration::from_secs(2));
+        assert_eq!(chain.rpc_timeout(), Duration::from_secs(30));
         assert_eq!(chain.max_block_range, 1_000);
         assert_eq!(chain.start_block, None);
         assert_eq!(chain.contracts[0].events, vec![EventKind::Transfer]);

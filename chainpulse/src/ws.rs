@@ -13,14 +13,12 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{ApiError, AppState};
 use crate::telemetry;
 
-/// What indexers publish after each commit or rollback.
 #[derive(Debug, Clone)]
 pub enum Notification {
     Event(Arc<EventRecord>),
     Reorg(Reorg),
 }
 
-/// Every event above `common_ancestor` on this chain that was already streamed is gone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Reorg {
     pub chain_id: u64,
