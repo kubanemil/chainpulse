@@ -1,22 +1,21 @@
-#![deny(clippy::unwrap_used, clippy::expect_used)]
+use std::fmt;
+use std::str::FromStr;
 
+use alloy::primitives::{Address, B256, LogData};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Value, json};
 
-// ── Top-level ERC-20 Transfer ──────────────────────────────────────────────
+pub use alloy::primitives;
 
 sol! {
     #[derive(Debug)]
     event Transfer(address indexed from, address indexed to, uint256 value);
 }
 
-// ── Uniswap V2 events ─────────────────────────────────────────────────────
-
-pub mod uniswap_v2 {
-    use alloy::sol;
-
-    sol! {
+mod uniswap_v2 {
+    alloy::sol! {
         #[derive(Debug)]
         event Swap(
             address indexed sender,
@@ -26,25 +25,14 @@ pub mod uniswap_v2 {
             uint256 amount1Out,
             address indexed to
         );
-    }
 
-    sol! {
         #[derive(Debug)]
-        event PairCreated(
-            address indexed token0,
-            address indexed token1,
-            address pair,
-            uint256
-        );
+        event PairCreated(address indexed token0, address indexed token1, address pair, uint256);
     }
 }
 
-// ── Uniswap V3 events ─────────────────────────────────────────────────────
-
-pub mod uniswap_v3 {
-    use alloy::sol;
-
-    sol! {
+mod uniswap_v3 {
+    alloy::sol! {
         #[derive(Debug)]
         event Swap(
             address indexed sender,
@@ -55,9 +43,7 @@ pub mod uniswap_v3 {
             uint128 liquidity,
             int24 tick
         );
-    }
 
-    sol! {
         #[derive(Debug)]
         event PoolCreated(
             address indexed token0,
@@ -69,12 +55,8 @@ pub mod uniswap_v3 {
     }
 }
 
-// ── Aave V3 events ────────────────────────────────────────────────────────
-
-pub mod aave {
-    use alloy::sol;
-
-    sol! {
+mod aave_v3 {
+    alloy::sol! {
         #[derive(Debug)]
         event Supply(
             address indexed reserve,
@@ -83,567 +65,401 @@ pub mod aave {
             uint256 amount,
             uint16 indexed referralCode
         );
-    }
 
-    sol! {
         #[derive(Debug)]
-        event Withdraw(
-            address indexed reserve,
-            address indexed user,
-            address indexed to,
-            uint256 amount
-        );
-    }
-}
+        event Withdraw(address indexed reserve, address indexed user, address indexed to, uint256 amount);
 
-// ── stkAAVE events ────────────────────────────────────────────────────────
-
-pub mod stkaave {
-    use alloy::sol;
-
-    sol! {
         #[derive(Debug)]
-        event Staked(
-            address indexed from,
-            address indexed onBehalfOf,
-            uint256 amount
-        );
+        event Staked(address indexed from, address indexed onBehalfOf, uint256 amount);
     }
 }
 
-// ── NormalizedEvent ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NormalizedEvent {
-    pub event_type: String,
-    pub contract_address: String,
-    pub tx_hash: String,
-    pub block_number: i64,
-    pub log_index: i32,
-    pub chain_id: i32,
-    pub payload: serde_json::Value,
+/// An event ChainPulse knows how to decode. The name is what config files and the API use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EventKind {
+    Transfer,
+    SwapV2,
+    SwapV3,
+    PairCreated,
+    PoolCreated,
+    Supply,
+    Withdraw,
+    Staked,
 }
 
-// ── decode_log ─────────────────────────────────────────────────────────────
+impl EventKind {
+    pub const ALL: [EventKind; 8] = [
+        Self::Transfer,
+        Self::SwapV2,
+        Self::SwapV3,
+        Self::PairCreated,
+        Self::PoolCreated,
+        Self::Supply,
+        Self::Withdraw,
+        Self::Staked,
+    ];
 
-/// Format an address as 0x-prefixed lowercase hex.
-fn fmt_addr(addr: &alloy::primitives::Address) -> String {
-    format!("{}", addr).to_lowercase()
-}
-
-/// Decode a raw Alloy log into a NormalizedEvent by matching topic0 against
-/// all known event signature hashes.
-pub fn decode_log(log: &alloy::rpc::types::Log, chain_id: i32) -> Option<NormalizedEvent> {
-    let topic0 = log.topic0()?;
-
-    let block_number = log.block_number.unwrap_or(0) as i64;
-    let log_index = log.log_index.unwrap_or(0) as i32;
-    let tx_hash = format!("{}", log.transaction_hash.unwrap_or_default());
-    let contract_address = fmt_addr(&log.address());
-
-    let (event_type, payload) = if *topic0 == Transfer::SIGNATURE_HASH {
-        let d = Transfer::decode_log_data(&log.inner.data).ok()?;
-        (
-            "Transfer",
-            serde_json::json!({
-                "from": fmt_addr(&d.from),
-                "to": fmt_addr(&d.to),
-                "value": d.value.to_string(),
-            }),
-        )
-    } else if *topic0 == uniswap_v2::Swap::SIGNATURE_HASH {
-        let d = uniswap_v2::Swap::decode_log_data(&log.inner.data).ok()?;
-        (
-            "SwapV2",
-            serde_json::json!({
-                "sender": fmt_addr(&d.sender),
-                "amount0_in": d.amount0In.to_string(),
-                "amount1_in": d.amount1In.to_string(),
-                "amount0_out": d.amount0Out.to_string(),
-                "amount1_out": d.amount1Out.to_string(),
-                "to": fmt_addr(&d.to),
-            }),
-        )
-    } else if *topic0 == uniswap_v3::Swap::SIGNATURE_HASH {
-        let d = uniswap_v3::Swap::decode_log_data(&log.inner.data).ok()?;
-        let tick: i32 = d.tick.as_i32();
-        (
-            "SwapV3",
-            serde_json::json!({
-                "sender": fmt_addr(&d.sender),
-                "recipient": fmt_addr(&d.recipient),
-                "amount0": d.amount0.to_string(),
-                "amount1": d.amount1.to_string(),
-                "sqrt_price_x96": d.sqrtPriceX96.to_string(),
-                "liquidity": d.liquidity.to_string(),
-                "tick": tick,
-            }),
-        )
-    } else if *topic0 == aave::Supply::SIGNATURE_HASH {
-        let d = aave::Supply::decode_log_data(&log.inner.data).ok()?;
-        let referral_code: u16 = d.referralCode;
-        (
-            "Supply",
-            serde_json::json!({
-                "reserve": fmt_addr(&d.reserve),
-                "user": fmt_addr(&d.user),
-                "on_behalf_of": fmt_addr(&d.onBehalfOf),
-                "amount": d.amount.to_string(),
-                "referral_code": referral_code,
-            }),
-        )
-    } else if *topic0 == aave::Withdraw::SIGNATURE_HASH {
-        let d = aave::Withdraw::decode_log_data(&log.inner.data).ok()?;
-        (
-            "Withdraw",
-            serde_json::json!({
-                "reserve": fmt_addr(&d.reserve),
-                "user": fmt_addr(&d.user),
-                "to": fmt_addr(&d.to),
-                "amount": d.amount.to_string(),
-            }),
-        )
-    } else if *topic0 == stkaave::Staked::SIGNATURE_HASH {
-        let d = stkaave::Staked::decode_log_data(&log.inner.data).ok()?;
-        (
-            "Staked",
-            serde_json::json!({
-                "from": fmt_addr(&d.from),
-                "on_behalf_of": fmt_addr(&d.onBehalfOf),
-                "amount": d.amount.to_string(),
-            }),
-        )
-    } else if *topic0 == uniswap_v2::PairCreated::SIGNATURE_HASH {
-        let d = uniswap_v2::PairCreated::decode_log_data(&log.inner.data).ok()?;
-        (
-            "PairCreated",
-            serde_json::json!({
-                "token0": fmt_addr(&d.token0),
-                "token1": fmt_addr(&d.token1),
-                "pair": fmt_addr(&d.pair),
-                "pair_index": d._3.to_string(),
-            }),
-        )
-    } else if *topic0 == uniswap_v3::PoolCreated::SIGNATURE_HASH {
-        let d = uniswap_v3::PoolCreated::decode_log_data(&log.inner.data).ok()?;
-        let fee: u32 = d.fee.to::<u32>();
-        let tick_spacing: i32 = d.tickSpacing.as_i32();
-        (
-            "PoolCreated",
-            serde_json::json!({
-                "token0": fmt_addr(&d.token0),
-                "token1": fmt_addr(&d.token1),
-                "fee": fee,
-                "tick_spacing": tick_spacing,
-                "pool": fmt_addr(&d.pool),
-            }),
-        )
-    } else {
-        return None;
-    };
-
-    Some(NormalizedEvent {
-        event_type: event_type.to_string(),
-        contract_address,
-        tx_hash,
-        block_number,
-        log_index,
-        chain_id,
-        payload,
-    })
-}
-
-// ── default_contracts ──────────────────────────────────────────────────────
-
-/// Returns the hardcoded list of Ethereum mainnet contract addresses to track.
-pub fn default_eth_contracts() -> Vec<alloy::primitives::Address> {
-    use alloy::primitives::address;
-    vec![
-        address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
-        address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
-        address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
-        address!("6B175474E89094C44Da98b954EedeAC495271d0F"), // DAI
-        address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"), // Uniswap V2 Factory
-        address!("1F98431c8aD98523631AE4a59f267346ea31F984"), // Uniswap V3 Factory
-        address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"), // Aave V3 Pool
-        address!("4da27a545c0c5B758a6BA100e3a049001de870f5"), // stkAAVE
-    ]
-}
-
-/// Returns the hardcoded list of Polygon PoS contract addresses to track.
-pub fn default_polygon_contracts() -> Vec<alloy::primitives::Address> {
-    use alloy::primitives::address;
-    vec![
-        address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // USDC (bridged)
-        address!("3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), // USDC (native)
-        address!("c2132D05D31c914a87C6611C10748AEb04B58e8F"), // USDT
-        address!("0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), // WMATIC
-        address!("7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"), // WETH
-        address!("5757371414417b8C6CAad45bAeF941aBc7d3Ab32"), // QuickSwap Factory
-        address!("794a61358D6845594F94dc1DB02A252b5b4814aD"), // Aave V3 Pool
-    ]
-}
-
-// ── Tests ──────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use alloy::primitives::{address, b256, Address, B256, LogData, U256};
-
-    /// Helper to build a mock `alloy::rpc::types::Log`.
-    fn mock_log(
-        addr: Address,
-        topics: Vec<B256>,
-        data: Vec<u8>,
-        block_number: u64,
-        log_index: u64,
-        tx_hash: B256,
-    ) -> alloy::rpc::types::Log {
-        let inner = alloy::primitives::Log {
-            address: addr,
-            data: LogData::new(topics, data.into()).unwrap(),
-        };
-        alloy::rpc::types::Log {
-            inner,
-            block_hash: Some(B256::ZERO),
-            block_number: Some(block_number),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash),
-            transaction_index: Some(0),
-            log_index: Some(log_index),
-            removed: false,
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Transfer => "Transfer",
+            Self::SwapV2 => "SwapV2",
+            Self::SwapV3 => "SwapV3",
+            Self::PairCreated => "PairCreated",
+            Self::PoolCreated => "PoolCreated",
+            Self::Supply => "Supply",
+            Self::Withdraw => "Withdraw",
+            Self::Staked => "Staked",
         }
     }
 
+    pub const fn topic0(self) -> B256 {
+        match self {
+            Self::Transfer => Transfer::SIGNATURE_HASH,
+            Self::SwapV2 => uniswap_v2::Swap::SIGNATURE_HASH,
+            Self::SwapV3 => uniswap_v3::Swap::SIGNATURE_HASH,
+            Self::PairCreated => uniswap_v2::PairCreated::SIGNATURE_HASH,
+            Self::PoolCreated => uniswap_v3::PoolCreated::SIGNATURE_HASH,
+            Self::Supply => aave_v3::Supply::SIGNATURE_HASH,
+            Self::Withdraw => aave_v3::Withdraw::SIGNATURE_HASH,
+            Self::Staked => aave_v3::Staked::SIGNATURE_HASH,
+        }
+    }
+
+    /// Decodes the log into a JSON payload. Integers are strings so no precision is lost.
+    pub fn decode(self, log: &LogData) -> alloy::sol_types::Result<Value> {
+        let payload = match self {
+            Self::Transfer => {
+                let e = Transfer::decode_log_data(log)?;
+                json!({ "from": hex(&e.from), "to": hex(&e.to), "value": e.value.to_string() })
+            }
+            Self::SwapV2 => {
+                let e = uniswap_v2::Swap::decode_log_data(log)?;
+                json!({
+                    "sender": hex(&e.sender),
+                    "to": hex(&e.to),
+                    "amount0_in": e.amount0In.to_string(),
+                    "amount1_in": e.amount1In.to_string(),
+                    "amount0_out": e.amount0Out.to_string(),
+                    "amount1_out": e.amount1Out.to_string(),
+                })
+            }
+            Self::SwapV3 => {
+                let e = uniswap_v3::Swap::decode_log_data(log)?;
+                json!({
+                    "sender": hex(&e.sender),
+                    "recipient": hex(&e.recipient),
+                    "amount0": e.amount0.to_string(),
+                    "amount1": e.amount1.to_string(),
+                    "sqrt_price_x96": e.sqrtPriceX96.to_string(),
+                    "liquidity": e.liquidity.to_string(),
+                    "tick": e.tick.as_i32(),
+                })
+            }
+            Self::PairCreated => {
+                let e = uniswap_v2::PairCreated::decode_log_data(log)?;
+                json!({
+                    "token0": hex(&e.token0),
+                    "token1": hex(&e.token1),
+                    "pair": hex(&e.pair),
+                    "pair_index": e._3.to_string(),
+                })
+            }
+            Self::PoolCreated => {
+                let e = uniswap_v3::PoolCreated::decode_log_data(log)?;
+                json!({
+                    "token0": hex(&e.token0),
+                    "token1": hex(&e.token1),
+                    "fee": e.fee.to::<u32>(),
+                    "tick_spacing": e.tickSpacing.as_i32(),
+                    "pool": hex(&e.pool),
+                })
+            }
+            Self::Supply => {
+                let e = aave_v3::Supply::decode_log_data(log)?;
+                json!({
+                    "reserve": hex(&e.reserve),
+                    "user": hex(&e.user),
+                    "on_behalf_of": hex(&e.onBehalfOf),
+                    "amount": e.amount.to_string(),
+                    "referral_code": e.referralCode,
+                })
+            }
+            Self::Withdraw => {
+                let e = aave_v3::Withdraw::decode_log_data(log)?;
+                json!({
+                    "reserve": hex(&e.reserve),
+                    "user": hex(&e.user),
+                    "to": hex(&e.to),
+                    "amount": e.amount.to_string(),
+                })
+            }
+            Self::Staked => {
+                let e = aave_v3::Staked::decode_log_data(log)?;
+                json!({
+                    "from": hex(&e.from),
+                    "on_behalf_of": hex(&e.onBehalfOf),
+                    "amount": e.amount.to_string(),
+                })
+            }
+        };
+        Ok(payload)
+    }
+}
+
+impl fmt::Display for EventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownEventKind(pub String);
+
+impl fmt::Display for UnknownEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let known: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
+        write!(
+            f,
+            "unknown event `{}`, expected one of: {}",
+            self.0,
+            known.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownEventKind {}
+
+impl FromStr for EventKind {
+    type Err = UnknownEventKind;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.name() == s)
+            .ok_or_else(|| UnknownEventKind(s.to_owned()))
+    }
+}
+
+impl Serialize for EventKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Lowercase `0x` hex, the one address format stored and served everywhere.
+pub fn hex(address: &Address) -> String {
+    format!("{address:#x}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRef {
+    pub number: u64,
+    pub hash: B256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    pub number: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    pub timestamp: u64,
+}
+
+impl Block {
+    pub fn to_ref(&self) -> BlockRef {
+        BlockRef {
+            number: self.number,
+            hash: self.hash,
+        }
+    }
+}
+
+/// A decoded log from a block the indexer has verified against the chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    pub chain_id: u64,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub block_timestamp: u64,
+    pub log_index: u64,
+    pub tx_hash: B256,
+    pub contract: Address,
+    pub kind: EventKind,
+    pub payload: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{I256, U160, U256, address, aliases::I24, aliases::U24};
+    use std::collections::HashSet;
+
+    const A: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const B: Address = address!("BBbBbBBbbBbbbbBBbBbbBBbBBBbbBBbbbbbbBbBb");
+    const C: Address = address!("cccccccccccccccccccccccccccccccccccccccc");
+
     #[test]
-    fn test_decode_transfer() {
-        use alloy::sol_types::SolEvent;
+    fn decodes_erc20_transfer_with_lowercase_addresses() {
+        let log = Transfer {
+            from: A,
+            to: B,
+            value: U256::from(1_000_000u64),
+        }
+        .encode_log_data();
 
-        let from = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let to = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let value = U256::from(1_000_000u64);
+        let payload = EventKind::Transfer.decode(&log).unwrap();
 
-        // Encode the event log data
-        let log_data = Transfer::encode_log_data(&Transfer { from, to, value });
-
-        let log = mock_log(
-            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_000,
-            5,
-            b256!("1111111111111111111111111111111111111111111111111111111111111111"),
-        );
-
-        let event = decode_log(&log, 1).expect("should decode Transfer");
-        assert_eq!(event.event_type, "Transfer");
-        assert_eq!(event.block_number, 18_000_000);
-        assert_eq!(event.log_index, 5);
-        assert_eq!(event.chain_id, 1);
         assert_eq!(
-            event.payload["from"],
-            format!("{}", from).to_lowercase()
+            payload,
+            json!({
+                "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "value": "1000000",
+            })
         );
-        assert_eq!(event.payload["value"], "1000000");
     }
 
     #[test]
-    fn test_decode_swap_v2() {
-        use alloy::sol_types::SolEvent;
-
-        let sender = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let to = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let evt = uniswap_v2::Swap {
-            sender,
+    fn decodes_uniswap_v2_swap() {
+        let log = uniswap_v2::Swap {
+            sender: A,
             amount0In: U256::from(100u64),
             amount1In: U256::ZERO,
             amount0Out: U256::ZERO,
             amount1Out: U256::from(200u64),
-            to,
-        };
-        let log_data = uniswap_v2::Swap::encode_log_data(&evt);
+            to: B,
+        }
+        .encode_log_data();
 
-        let log = mock_log(
-            address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_001,
-            10,
-            B256::ZERO,
-        );
+        let payload = EventKind::SwapV2.decode(&log).unwrap();
 
-        let event = decode_log(&log, 1).expect("should decode SwapV2");
-        assert_eq!(event.event_type, "SwapV2");
-        assert_eq!(event.payload["amount0_in"], "100");
-        assert_eq!(event.payload["amount1_out"], "200");
+        assert_eq!(payload["amount0_in"], "100");
+        assert_eq!(payload["amount1_out"], "200");
     }
 
     #[test]
-    fn test_decode_swap_v3() {
-        use alloy::primitives::{I256, U160};
-        use alloy::sol_types::SolEvent;
-
-        let sender = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let recipient = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let evt = uniswap_v3::Swap {
-            sender,
-            recipient,
+    fn decodes_uniswap_v3_swap_with_signed_amounts() {
+        let log = uniswap_v3::Swap {
+            sender: A,
+            recipient: B,
             amount0: I256::try_from(500i64).unwrap(),
             amount1: I256::try_from(-300i64).unwrap(),
             sqrtPriceX96: U160::from(1_000_000u64),
-            liquidity: 999u128,
-            tick: 100i32.try_into().unwrap(),
-        };
-        let log_data = uniswap_v3::Swap::encode_log_data(&evt);
+            liquidity: 999,
+            tick: I24::try_from(-100i32).unwrap(),
+        }
+        .encode_log_data();
 
-        let log = mock_log(
-            address!("1F98431c8aD98523631AE4a59f267346ea31F984"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_002,
-            0,
-            B256::ZERO,
-        );
+        let payload = EventKind::SwapV3.decode(&log).unwrap();
 
-        let event = decode_log(&log, 1).expect("should decode SwapV3");
-        assert_eq!(event.event_type, "SwapV3");
-        assert_eq!(event.payload["amount0"], "500");
-        assert_eq!(event.payload["amount1"], "-300");
-        assert_eq!(event.payload["tick"], 100);
+        assert_eq!(payload["amount0"], "500");
+        assert_eq!(payload["amount1"], "-300");
+        assert_eq!(payload["tick"], -100);
     }
 
     #[test]
-    fn test_decode_supply() {
-        use alloy::sol_types::SolEvent;
+    fn decodes_pool_and_pair_creation() {
+        let pool = uniswap_v3::PoolCreated {
+            token0: A,
+            token1: B,
+            fee: U24::from(3000u32),
+            tickSpacing: I24::try_from(60i32).unwrap(),
+            pool: C,
+        }
+        .encode_log_data();
+        let pair = uniswap_v2::PairCreated {
+            token0: A,
+            token1: B,
+            pair: C,
+            _3: U256::from(7u64),
+        }
+        .encode_log_data();
 
-        let evt = aave::Supply {
-            reserve: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            user: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            onBehalfOf: address!("cccccccccccccccccccccccccccccccccccccccc"),
+        assert_eq!(EventKind::PoolCreated.decode(&pool).unwrap()["fee"], 3000);
+        assert_eq!(
+            EventKind::PairCreated.decode(&pair).unwrap()["pair_index"],
+            "7"
+        );
+    }
+
+    #[test]
+    fn decodes_aave_events() {
+        let supply = aave_v3::Supply {
+            reserve: A,
+            user: B,
+            onBehalfOf: C,
             amount: U256::from(5000u64),
-            referralCode: 42u16,
-        };
-        let log_data = aave::Supply::encode_log_data(&evt);
+            referralCode: 42,
+        }
+        .encode_log_data();
+        let withdraw = aave_v3::Withdraw {
+            reserve: A,
+            user: B,
+            to: C,
+            amount: U256::from(7u64),
+        }
+        .encode_log_data();
+        let staked = aave_v3::Staked {
+            from: A,
+            onBehalfOf: B,
+            amount: U256::from(9u64),
+        }
+        .encode_log_data();
 
-        let log = mock_log(
-            address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_003,
-            1,
-            B256::ZERO,
+        assert_eq!(
+            EventKind::Supply.decode(&supply).unwrap()["referral_code"],
+            42
         );
-
-        let event = decode_log(&log, 1).expect("should decode Supply");
-        assert_eq!(event.event_type, "Supply");
-        assert_eq!(event.payload["amount"], "5000");
-        assert_eq!(event.payload["referral_code"], 42);
+        assert_eq!(
+            EventKind::Withdraw.decode(&withdraw).unwrap()["amount"],
+            "7"
+        );
+        assert_eq!(EventKind::Staked.decode(&staked).unwrap()["amount"], "9");
     }
 
     #[test]
-    fn test_decode_withdraw() {
-        use alloy::sol_types::SolEvent;
-
-        let evt = aave::Withdraw {
-            reserve: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            user: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            to: address!("cccccccccccccccccccccccccccccccccccccccc"),
-            amount: U256::from(7777u64),
-        };
-        let log_data = aave::Withdraw::encode_log_data(&evt);
-
-        let log = mock_log(
-            address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_004,
-            2,
-            B256::ZERO,
-        );
-
-        let event = decode_log(&log, 1).expect("should decode Withdraw");
-        assert_eq!(event.event_type, "Withdraw");
-        assert_eq!(event.payload["amount"], "7777");
-    }
-
-    #[test]
-    fn test_decode_staked() {
-        use alloy::sol_types::SolEvent;
-
-        let evt = stkaave::Staked {
-            from: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            onBehalfOf: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            amount: U256::from(9999u64),
-        };
-        let log_data = stkaave::Staked::encode_log_data(&evt);
-
-        let log = mock_log(
-            address!("4da27a545c0c5B758a6BA100e3a049001de870f5"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_005,
-            3,
-            B256::ZERO,
-        );
-
-        let event = decode_log(&log, 1).expect("should decode Staked");
-        assert_eq!(event.event_type, "Staked");
-        assert_eq!(event.payload["amount"], "9999");
-    }
-
-    #[test]
-    fn test_decode_pair_created() {
-        use alloy::sol_types::SolEvent;
-
-        let evt = uniswap_v2::PairCreated {
-            token0: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            token1: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            pair: address!("cccccccccccccccccccccccccccccccccccccccc"),
-            _3: U256::from(12345u64),
-        };
-        let log_data = uniswap_v2::PairCreated::encode_log_data(&evt);
-
-        let log = mock_log(
-            address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_006,
-            0,
-            B256::ZERO,
-        );
-
-        let event = decode_log(&log, 1).expect("should decode PairCreated");
-        assert_eq!(event.event_type, "PairCreated");
-        assert_eq!(event.payload["pair_index"], "12345");
-    }
-
-    #[test]
-    fn test_decode_pool_created() {
-        use alloy::sol_types::SolEvent;
-
-        let evt = uniswap_v3::PoolCreated {
-            token0: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            token1: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-            fee: 3000u32.try_into().unwrap(),
-            tickSpacing: 60i32.try_into().unwrap(),
-            pool: address!("cccccccccccccccccccccccccccccccccccccccc"),
-        };
-        let log_data = uniswap_v3::PoolCreated::encode_log_data(&evt);
-
-        let log = mock_log(
-            address!("1F98431c8aD98523631AE4a59f267346ea31F984"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            18_000_007,
-            1,
-            B256::ZERO,
-        );
-
-        let event = decode_log(&log, 1).expect("should decode PoolCreated");
-        assert_eq!(event.event_type, "PoolCreated");
-        assert_eq!(event.payload["fee"], 3000);
-        assert_eq!(event.payload["tick_spacing"], 60);
-    }
-
-    #[test]
-    fn test_unknown_topic_returns_none() {
-        let unknown_topic = b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        let log = mock_log(
-            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            vec![unknown_topic],
-            vec![],
-            18_000_000,
-            0,
-            B256::ZERO,
-        );
-
-        assert!(decode_log(&log, 1).is_none());
-    }
-
-    #[test]
-    fn test_malformed_data_returns_none() {
-        // Correct topic0 for Transfer but garbage data
-        let log = mock_log(
-            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+    fn rejects_log_with_malformed_data() {
+        let log = LogData::new_unchecked(
             vec![Transfer::SIGNATURE_HASH, B256::ZERO, B256::ZERO],
-            vec![0xde, 0xad], // too short to be a valid U256
-            18_000_000,
-            0,
-            B256::ZERO,
+            vec![0xde, 0xad].into(),
         );
 
-        assert!(decode_log(&log, 1).is_none());
+        assert!(EventKind::Transfer.decode(&log).is_err());
     }
 
     #[test]
-    fn test_no_topics_returns_none() {
-        let inner = alloy::primitives::Log {
-            address: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            data: LogData::new(vec![], vec![].into()).unwrap(),
-        };
-        let log = alloy::rpc::types::Log {
-            inner,
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: None,
-            transaction_index: None,
-            log_index: None,
-            removed: false,
-        };
-
-        assert!(decode_log(&log, 1).is_none());
-    }
-
-    #[test]
-    fn test_default_eth_contracts_count() {
-        let contracts = default_eth_contracts();
-        assert_eq!(contracts.len(), 8);
-    }
-
-    #[test]
-    fn test_default_eth_contracts_contains_usdc() {
-        let contracts = default_eth_contracts();
-        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        assert!(contracts.contains(&usdc));
-    }
-
-    #[test]
-    fn test_default_polygon_contracts_count() {
-        let contracts = default_polygon_contracts();
-        assert_eq!(contracts.len(), 7);
-    }
-
-    #[test]
-    fn test_default_polygon_contracts_contains_usdc_bridged() {
-        let contracts = default_polygon_contracts();
-        let usdc_bridged = address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
-        assert!(contracts.contains(&usdc_bridged));
-    }
-
-    #[test]
-    fn test_decode_log_chain_id_137() {
-        use alloy::sol_types::SolEvent;
-
-        let from = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let to = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let value = U256::from(1_000_000u64);
-
-        let log_data = Transfer::encode_log_data(&Transfer { from, to, value });
-
-        let log = mock_log(
-            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            log_data.topics().to_vec(),
-            log_data.data.to_vec(),
-            50_000_000,
-            2,
-            b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+    fn rejects_erc721_transfer_with_extra_indexed_topic() {
+        let log = LogData::new_unchecked(
+            vec![Transfer::SIGNATURE_HASH, B256::ZERO, B256::ZERO, B256::ZERO],
+            Vec::new().into(),
         );
 
-        let event = decode_log(&log, 137).expect("should decode Transfer with chain_id 137");
-        assert_eq!(event.chain_id, 137);
-        assert_eq!(event.event_type, "Transfer");
+        assert!(EventKind::Transfer.decode(&log).is_err());
+    }
+
+    #[test]
+    fn every_kind_has_a_distinct_topic() {
+        let topics: HashSet<B256> = EventKind::ALL.iter().map(|k| k.topic0()).collect();
+
+        assert_eq!(topics.len(), EventKind::ALL.len());
+    }
+
+    #[test]
+    fn names_round_trip_and_unknown_names_list_the_valid_ones() {
+        for kind in EventKind::ALL {
+            assert_eq!(kind.name().parse::<EventKind>(), Ok(kind));
+        }
+
+        let err = "transfer".parse::<EventKind>().unwrap_err().to_string();
+
+        assert!(err.contains("unknown event `transfer`"));
+        assert!(err.contains("Transfer, SwapV2"));
     }
 }

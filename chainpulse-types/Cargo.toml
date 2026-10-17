@@ -1,10 +1,13 @@
 [package]
 name = "chainpulse-types"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-alloy = { version = "1", features = ["sol-types", "rpc-types"] }
+alloy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
+
+[lints]
+workspace = true

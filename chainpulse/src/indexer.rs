@@ -1,387 +1,415 @@
-use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::rpc::types::Filter;
-use alloy::eips::BlockNumberOrTag;
-use chainpulse_types::NormalizedEvent;
-use chrono::Utc;
-use futures_util::StreamExt;
-use metrics::gauge;
-use sqlx::PgPool;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
+
+use alloy::eips::BlockNumberOrTag;
+use alloy::primitives::B256;
+use alloy::providers::{Provider, RootProvider};
+use alloy::rpc::types::Log;
+use alloy::transports::TransportError;
+use chainpulse_config::ChainConfig;
+use chainpulse_db::{self as db, Commit, DbError, PgPool};
+use chainpulse_types::{Block, BlockRef};
+use futures_util::{StreamExt, TryStreamExt, stream};
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 
-use crate::api::HealthState;
+use crate::logs::{self, Inconsistent, Watched};
+use crate::reorg::{self, Broken, Plan};
+use crate::status::{ChainStatus, Progress};
+use crate::telemetry;
+use crate::ws::{Notification, Reorg};
 
-/// Number of blocks to fetch per `eth_getLogs` chunk during catch-up.
-/// 2,000 is safe for all major RPC providers (Alchemy free tier, Infura, Ankr, public nodes).
-const CATCH_UP_CHUNK_SIZE: u64 = 2_000;
+const RPC_CONCURRENCY: usize = 8;
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Per-chain configuration bundling all parameters needed by the indexer.
-#[derive(Debug, Clone)]
-pub struct ChainConfig {
-    pub name: String,
-    pub chain_id: i32,
-    pub ws_url: String,
-    pub contracts: Vec<Address>,
-}
-
-/// Errors from a single indexer session.
 #[derive(Debug, thiserror::Error)]
-pub enum IndexerError {
-    /// Recoverable: WS disconnect, connection failure, subscription failure.
-    #[error("recoverable: {0}")]
-    Recoverable(String),
-    /// Fatal: DB errors, irrecoverable failures.
-    #[error("fatal: {0}")]
-    Fatal(String),
+pub enum IndexError {
+    #[error("rpc: {0}")]
+    Rpc(#[from] TransportError),
+    #[error("node returned inconsistent data: {0}")]
+    Inconsistent(#[from] Inconsistent),
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("node serves chain id {actual}, config says {expected}")]
+    WrongChain { expected: u64, actual: u64 },
+    #[error(
+        "reorg on {chain} is deeper than its {confirmations} confirmations: no stored block is still canonical"
+    )]
+    ReorgTooDeep { chain: String, confirmations: u64 },
 }
 
-/// Outer reconnection loop. Contains backoff state and calls
-/// `run_session` in a loop, applying exponential backoff on failure.
-/// Returns `Result<(), IndexerError>` so it can be spawned as a Tokio task.
-pub async fn run_indexer(pool: PgPool, config: ChainConfig, tx: Sender<NormalizedEvent>, health_state: HealthState, token: CancellationToken) -> Result<(), IndexerError> {
-    let span = tracing::info_span!("chain", name = %config.name, chain_id = config.chain_id);
+impl IndexError {
+    /// Node trouble is retried with backoff. Anything else stops the process.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Rpc(_) | Self::Inconsistent(_))
+    }
+}
 
-    async {
-        let initial_backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(60);
-        let mut backoff = initial_backoff;
-        let mut retry_count: u32 = 0;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Idle,
+    Advanced {
+        to: u64,
+        events: usize,
+    },
+    RolledBack {
+        from: u64,
+        to: u64,
+        removed_events: u64,
+    },
+}
 
+pub async fn connect(rpc_url: &str) -> Result<RootProvider, TransportError> {
+    RootProvider::connect(rpc_url).await
+}
+
+/// Indexes one chain. Each step polls the head, fetches what is new, checks it links onto the
+/// stored chain, and commits blocks, events and cursor in one transaction.
+pub struct Indexer {
+    chain: ChainConfig,
+    provider: RootProvider,
+    pool: PgPool,
+    watched: Watched,
+    feed: broadcast::Sender<Notification>,
+    progress: watch::Sender<Progress>,
+    cursor: Option<BlockRef>,
+    chain_verified: bool,
+    /// Block range per `eth_getLogs` call. Halves when the node rejects a range, grows back on success.
+    span: u64,
+}
+
+impl Indexer {
+    pub async fn new(
+        chain: ChainConfig,
+        provider: RootProvider,
+        pool: PgPool,
+        feed: broadcast::Sender<Notification>,
+    ) -> Result<Self, IndexError> {
+        let cursor = db::load_cursor(&pool, chain.id).await?;
+        let (progress, _) = watch::channel(Progress {
+            indexed: cursor.map(|c| c.number),
+            ..Progress::default()
+        });
+        Ok(Self {
+            watched: Watched::new(&chain.contracts),
+            span: chain.max_block_range,
+            chain,
+            provider,
+            pool,
+            feed,
+            progress,
+            cursor,
+            chain_verified: false,
+        })
+    }
+
+    pub fn status(&self) -> ChainStatus {
+        ChainStatus {
+            id: self.chain.id,
+            name: self.chain.name.clone(),
+            max_lag_blocks: self.chain.max_lag_blocks,
+            stale_after: (self.chain.poll_interval() * 10).max(Duration::from_secs(30)),
+            progress: self.progress.subscribe(),
+        }
+    }
+
+    pub fn cursor(&self) -> Option<BlockRef> {
+        self.cursor
+    }
+
+    /// Runs until `shutdown` fires. Returns an error only for failures retrying cannot fix.
+    pub async fn run(mut self, shutdown: CancellationToken) -> Result<(), IndexError> {
+        let mut failures: u32 = 0;
         loop {
-            // Check for cancellation before each session attempt
-            if token.is_cancelled() {
-                tracing::info!("Shutdown requested, stopping indexer");
-                return Ok(());
+            let step = tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                step = self.step() => step,
+            };
+            let pause = match step {
+                Ok(step) => {
+                    failures = 0;
+                    if step == Step::Idle {
+                        self.chain.poll_interval()
+                    } else {
+                        Duration::ZERO
+                    }
+                }
+                Err(err) if err.is_transient() => {
+                    telemetry::rpc_error(&self.chain.name);
+                    let delay = backoff(failures);
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(chain = %self.chain.name, error = %err, retry_in = ?delay, "step failed");
+                    delay
+                }
+                Err(err) => return Err(err),
+            };
+            if !pause.is_zero() {
+                tokio::select! {
+                    () = shutdown.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(pause) => {}
+                }
             }
+        }
+    }
 
-            // Log reconnect attempt only for actual retries (not the first connection attempt)
-            if retry_count > 0 {
-                tracing::warn!(
-                    retry_count = retry_count,
-                    backoff_secs = backoff.as_secs(),
-                    "Reconnecting..."
+    pub async fn step(&mut self) -> Result<Step, IndexError> {
+        if !self.chain_verified {
+            let actual = self.provider.get_chain_id().await?;
+            if actual != self.chain.id {
+                return Err(IndexError::WrongChain {
+                    expected: self.chain.id,
+                    actual,
+                });
+            }
+            self.chain_verified = true;
+        }
+
+        let head = self.provider.get_block_number().await?;
+        telemetry::head(&self.chain.name, head);
+        self.progress.send_modify(|p| {
+            p.head = Some(head);
+            p.polled_at = Some(Instant::now());
+        });
+
+        let cursor = self.cursor.map(|c| c.number);
+        let plan = reorg::plan(
+            cursor,
+            self.chain.start_block,
+            head,
+            self.chain.confirmations,
+            self.span,
+        );
+        match plan {
+            Plan::Wait => Ok(Step::Idle),
+            Plan::Verify(number) => self.verify(number).await,
+            Plan::Fetch { from, to, dense } => self.advance(from, to, dense, head).await,
+        }
+    }
+
+    /// Nothing new to index; a reorg may still have replaced blocks at or below the head.
+    async fn verify(&mut self, number: u64) -> Result<Step, IndexError> {
+        let stored = match self.cursor {
+            Some(cursor) if cursor.number == number => Some(cursor.hash),
+            _ => db::block_hash(&self.pool, self.chain.id, number).await?,
+        };
+        let Some(stored) = stored else {
+            return Ok(Step::Idle);
+        };
+        if self.block(number).await?.hash == stored {
+            Ok(Step::Idle)
+        } else {
+            self.roll_back().await
+        }
+    }
+
+    async fn advance(
+        &mut self,
+        from: u64,
+        to: u64,
+        dense: bool,
+        head: u64,
+    ) -> Result<Step, IndexError> {
+        let (blocks, logs) = if dense {
+            let blocks = self.blocks(from..=to).await?;
+            let logs = self.logs_by_block(&blocks).await?;
+            (blocks, logs)
+        } else {
+            let logs = self.logs_in_range(from, to).await?;
+            let mut numbers: BTreeSet<u64> =
+                logs.iter().filter_map(|log| log.block_number).collect();
+            numbers.extend([from, to]);
+            (self.blocks(numbers).await?, logs)
+        };
+
+        match reorg::check_links(self.cursor, &blocks) {
+            Ok(()) => {}
+            Err(Broken::Cursor) => return self.roll_back().await,
+            Err(Broken::Within(number)) => {
+                return Err(
+                    Inconsistent(format!("block {number} does not link to its parent")).into(),
+                );
+            }
+        }
+        let events = logs::assemble(self.chain.id, &blocks, &logs, &self.watched)?;
+        let Some(tip) = blocks.last().map(Block::to_ref) else {
+            return Err(Inconsistent("no blocks fetched".to_owned()).into());
+        };
+        let confirmed_block = head.saturating_sub(self.chain.confirmations);
+
+        let records = db::commit(
+            &self.pool,
+            &Commit {
+                chain_id: self.chain.id,
+                parent: self.cursor,
+                cursor: tip,
+                blocks: &blocks,
+                events: &events,
+                confirmed_block,
+                prune_below: tip.number.min(confirmed_block),
+            },
+        )
+        .await?;
+        self.cursor = Some(tip);
+
+        let mut per_type: HashMap<&str, u64> = HashMap::new();
+        for event in &events {
+            *per_type.entry(event.kind.name()).or_default() += 1;
+        }
+        for (event_type, count) in per_type {
+            telemetry::events_indexed(&self.chain.name, event_type, count);
+        }
+        telemetry::progress(&self.chain.name, head, tip.number);
+        self.progress.send_modify(|p| p.indexed = Some(tip.number));
+        tracing::debug!(chain = %self.chain.name, from, to, events = records.len(), "indexed");
+
+        let events = records.len();
+        for record in records {
+            let _ = self.feed.send(Notification::Event(Arc::new(record)));
+        }
+        Ok(Step::Advanced {
+            to: tip.number,
+            events,
+        })
+    }
+
+    /// The cursor is no longer canonical. Walk stored blocks from newest to oldest until the node
+    /// agrees with one, then drop everything above it.
+    async fn roll_back(&mut self) -> Result<Step, IndexError> {
+        let Some(cursor) = self.cursor else {
+            return Err(
+                Inconsistent("reorg reported before anything was indexed".to_owned()).into(),
+            );
+        };
+        let stored = db::recent_blocks(&self.pool, self.chain.id).await?;
+        for chunk in stored.chunks(RPC_CONCURRENCY) {
+            let canonical =
+                concurrently(chunk.iter().map(|block| self.canonical_hash(block.number))).await?;
+            let Some(ancestor) = reorg::common_ancestor(chunk, &canonical) else {
+                continue;
+            };
+            if ancestor == cursor {
+                return Err(
+                    Inconsistent("node reported a reorg it no longer shows".to_owned()).into(),
                 );
             }
 
-            tokio::select! {
-                _ = token.cancelled() => {
-                    tracing::info!("Shutdown requested, stopping indexer");
-                    return Ok(());
-                }
-                result = run_session(&pool, &config.ws_url, config.contracts.clone(), config.chain_id, retry_count, &tx, &config.name, &health_state, &token) => {
-                    match result {
-                        Ok(()) => {
-                            // Stream ended normally (WS disconnect) — treat as recoverable
-                            gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
-                            health_state.set_connected(&config.name, false).await;
-                            tracing::warn!(
-                                retry_count = retry_count,
-                                "WebSocket disconnected, will reconnect"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            backoff = std::cmp::min(backoff * 2, max_backoff);
-                            retry_count += 1;
-                        }
-                        Err(IndexerError::Recoverable(msg)) => {
-                            gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
-                            health_state.set_connected(&config.name, false).await;
-                            tracing::warn!(
-                                retry_count = retry_count,
-                                backoff_secs = backoff.as_secs(),
-                                error = %msg,
-                                "Reconnection failed"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            backoff = std::cmp::min(backoff * 2, max_backoff);
-                            retry_count += 1;
-                        }
-                        Err(IndexerError::Fatal(msg)) => {
-                            gauge!("chainpulse_ws_connected", "chain" => config.name.clone()).set(0.0);
-                            health_state.set_connected(&config.name, false).await;
-                            tracing::error!(error = %msg, "Fatal error, exiting");
-                            return Err(IndexerError::Fatal(msg));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    .instrument(span)
-    .await
-}
-
-/// Single connection session: connect WS, run catch-up, subscribe to live logs,
-/// and process events until stream ends. Returns `Ok(())` when stream ends
-/// (triggering reconnect) or `Err` on error.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_session(
-    pool: &PgPool,
-    ws_url: &str,
-    contracts: Vec<Address>,
-    chain_id: i32,
-    retry_count: u32,
-    tx: &Sender<NormalizedEvent>,
-    chain_name: &str,
-    health_state: &HealthState,
-    token: &CancellationToken,
-) -> Result<(), IndexerError> {
-    // Connect WebSocket
-    let ws = WsConnect::new(ws_url);
-    let provider = ProviderBuilder::new()
-        .connect_ws(ws)
-        .await
-        .map_err(|e| IndexerError::Recoverable(format!("WebSocket connect failed: {e}")))?;
-
-    gauge!("chainpulse_ws_connected", "chain" => chain_name.to_string()).set(1.0);
-    health_state.set_connected(chain_name, true).await;
-    tracing::info!(ws_url = %ws_url, "WebSocket connected");
-
-    // Log successful reconnect when this is a retry (not the initial connection)
-    if retry_count > 0 {
-        tracing::info!(retry_count = retry_count, "Reconnected successfully");
-    }
-
-    // Run catch-up before subscribing to live logs
-    catch_up(&provider, pool, &contracts, chain_id, tx).await?;
-
-    // Determine the starting block for the live subscription.
-    // If we have a last indexed block from DB (set by catch_up or prior runs),
-    // start from there + 1 to avoid a gap. Otherwise fall back to Latest.
-    let live_from_block = match chainpulse_db::get_last_indexed_block(pool, chain_id)
-        .await
-        .map_err(|e| IndexerError::Fatal(format!("DB error reading last indexed block: {e}")))?
-    {
-        Some(last) => {
-            let from = (last as u64).saturating_add(1);
-            tracing::info!(
-                from_block = from,
-                "Starting live subscription from block"
-            );
-            BlockNumberOrTag::Number(from)
-        }
-        None => {
-            tracing::info!("Starting live subscription from latest block");
-            BlockNumberOrTag::Latest
-        }
-    };
-
-    // Subscribe to live logs
-    let num_contracts = contracts.len();
-    let filter = Filter::new()
-        .address(contracts)
-        .from_block(live_from_block);
-
-    let sub = provider
-        .subscribe_logs(&filter)
-        .await
-        .map_err(|e| IndexerError::Recoverable(format!("Failed to subscribe to logs: {e}")))?;
-
-    let mut stream = sub.into_stream();
-
-    tracing::info!(
-        contract_count = num_contracts,
-        "Subscribed to logs for {} contracts",
-        num_contracts
-    );
-
-    // Event processing loop -- send events to bounded channel with backpressure detection
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                tracing::info!("Shutdown requested, stopping event processing");
-                return Ok(());
-            }
-            log_opt = stream.next() => {
-                match log_opt {
-                    Some(log) => {
-                        if let Some(event) = chainpulse_types::decode_log(&log, chain_id) {
-                            tracing::info!(
-                                event_type = %event.event_type,
-                                block_number = event.block_number,
-                                contract_address = %event.contract_address,
-                                "Sending event to channel"
-                            );
-                            health_state.set_last_event_at(chain_name, Utc::now()).await;
-                            health_state.set_last_block(chain_name, event.block_number).await;
-                            backpressure_send(tx, event, chain_id).await?;
-                        } else {
-                            tracing::debug!("Skipping unknown event");
-                        }
-                    }
-                    None => {
-                        // Stream ended normally (WS disconnected)
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Detect the gap between `last_indexed_block` and the current chain head,
-/// then fetch and process all missed events via chunked `eth_getLogs` calls.
-///
-/// - If no `last_indexed_block` exists (fresh DB): skip and log INFO.
-/// - If already up to date: skip and log INFO.
-/// - Otherwise: fetch missed logs in `CATCH_UP_CHUNK_SIZE`-block chunks,
-///   processing each through `decode_log` + `insert_event`, and update
-///   `last_indexed_block` after each chunk.
-async fn catch_up(
-    provider: &impl Provider,
-    pool: &PgPool,
-    contracts: &[Address],
-    chain_id: i32,
-    tx: &Sender<NormalizedEvent>,
-) -> Result<(), IndexerError> {
-    let last_indexed = chainpulse_db::get_last_indexed_block(pool, chain_id)
-        .await
-        .map_err(|e| IndexerError::Fatal(format!("DB error reading last indexed block: {e}")))?;
-
-    let Some(last_block) = last_indexed else {
-        tracing::info!("No previous block, starting from latest");
-        return Ok(());
-    };
-
-    let head = provider
-        .get_block_number()
-        .await
-        .map_err(|e| IndexerError::Recoverable(format!("Failed to get block number: {e}")))?;
-
-    if last_block as u64 >= head {
-        tracing::info!(last_block = last_block, "Already up to date");
-        return Ok(());
-    }
-
-    let from_block = (last_block as u64).saturating_add(1);
-    let to_block = head;
-    let gap_blocks = to_block.saturating_sub(from_block).saturating_add(1);
-
-    tracing::info!(
-        from_block = from_block,
-        to_block = to_block,
-        gap_blocks = gap_blocks,
-        "Starting catch-up indexing"
-    );
-
-    let mut total_events: u64 = 0;
-    let mut chunk_from = from_block;
-
-    while chunk_from <= to_block {
-        let chunk_to = std::cmp::min(
-            chunk_from.saturating_add(CATCH_UP_CHUNK_SIZE).saturating_sub(1),
-            to_block,
-        );
-
-        let chunk_events =
-            fetch_logs_chunk(provider, pool, contracts, chain_id, chunk_from, chunk_to, tx).await?;
-
-        total_events = total_events.saturating_add(chunk_events);
-        chunk_from = chunk_to.saturating_add(1);
-    }
-
-    tracing::info!(
-        total_blocks = gap_blocks,
-        total_events = total_events,
-        "Catch-up complete"
-    );
-
-    Ok(())
-}
-
-/// Fetch one chunk of logs via `eth_getLogs` for the block range `[from, to]`,
-/// decode and insert each log, then update `last_indexed_block` to `to`.
-///
-/// Returns the number of events inserted in this chunk.
-/// If `get_logs` fails, returns a `Recoverable` error so the reconnection loop
-/// can retry from the last completed chunk.
-async fn fetch_logs_chunk(
-    provider: &impl Provider,
-    _pool: &PgPool,
-    contracts: &[Address],
-    chain_id: i32,
-    from: u64,
-    to: u64,
-    tx: &Sender<NormalizedEvent>,
-) -> Result<u64, IndexerError> {
-    let filter = Filter::new()
-        .address(contracts.to_vec())
-        .from_block(BlockNumberOrTag::Number(from))
-        .to_block(BlockNumberOrTag::Number(to));
-
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .map_err(|e| IndexerError::Recoverable(format!("eth_getLogs failed for blocks {from}-{to}: {e}")))?;
-
-    let mut events_count: u64 = 0;
-
-    for log in &logs {
-        if let Some(event) = chainpulse_types::decode_log(log, chain_id) {
-            backpressure_send(tx, event, chain_id).await?;
-            events_count = events_count.saturating_add(1);
-        }
-    }
-
-    // Block tracking is handled by the DB writer task via batch_upsert_last_indexed_blocks.
-
-    tracing::info!(
-        chunk_from = from,
-        chunk_to = to,
-        events_count = events_count,
-        "Catch-up chunk processed"
-    );
-
-    Ok(events_count)
-}
-
-/// Send an event to the bounded channel with backpressure detection and logging.
-///
-/// Uses `try_send` first to detect whether the channel is full. If the channel
-/// is at capacity, logs a warning and falls back to the blocking `send().await`,
-/// which applies backpressure by suspending the calling task until space is available.
-/// Also instruments the total send duration so operators can observe backpressure latency.
-async fn backpressure_send(
-    tx: &Sender<NormalizedEvent>,
-    event: NormalizedEvent,
-    chain_id: i32,
-) -> Result<(), IndexerError> {
-    // Record channel utilization: (max_capacity - available_capacity) / max_capacity
-    let max_cap = tx.max_capacity();
-    let cap = tx.capacity();
-    if max_cap > 0 {
-        let utilization = (max_cap - cap) as f64 / max_cap as f64;
-        gauge!("chainpulse_channel_utilization").set(utilization);
-    }
-
-    match tx.try_send(event) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(event)) => {
+            let removed_events = db::rollback(&self.pool, self.chain.id, cursor, ancestor).await?;
+            let depth = cursor.number - ancestor.number;
+            self.cursor = Some(ancestor);
+            telemetry::reorg(&self.chain.name, depth);
+            self.progress
+                .send_modify(|p| p.indexed = Some(ancestor.number));
             tracing::warn!(
-                chain_id = chain_id,
-                "Channel full, applying backpressure — subscriber will block until space is available"
+                chain = %self.chain.name, from = cursor.number, to = ancestor.number, depth, removed_events,
+                "reorg: rolled back to common ancestor"
             );
-            let start = Instant::now();
-            tx.send(event).await.map_err(|e| {
-                IndexerError::Fatal(format!(
-                    "Channel send failed (DB writer crashed?): {e}"
-                ))
-            })?;
-            let wait_ms = start.elapsed().as_millis();
-            tracing::info!(
-                chain_id = chain_id,
-                backpressure_wait_ms = wait_ms,
-                "Backpressure relieved, send completed"
-            );
-            Ok(())
+            let _ = self.feed.send(Notification::Reorg(Reorg {
+                chain_id: self.chain.id,
+                common_ancestor: ancestor.number,
+                depth,
+                removed_events,
+            }));
+            return Ok(Step::RolledBack {
+                from: cursor.number,
+                to: ancestor.number,
+                removed_events,
+            });
         }
-        Err(TrySendError::Closed(_)) => {
-            Err(IndexerError::Fatal(
-                "Channel closed (DB writer crashed?)".to_string(),
-            ))
+        Err(IndexError::ReorgTooDeep {
+            chain: self.chain.name.clone(),
+            confirmations: self.chain.confirmations,
+        })
+    }
+
+    async fn logs_in_range(&mut self, from: u64, to: u64) -> Result<Vec<Log>, IndexError> {
+        let filter = self.watched.filter().from_block(from).to_block(to);
+        match self.provider.get_logs(&filter).await {
+            Ok(logs) => {
+                self.span = self.span.saturating_mul(2).min(self.chain.max_block_range);
+                Ok(logs)
+            }
+            Err(err) => {
+                // Providers cap results per call; a smaller range is the usual fix.
+                self.span = (self.span / 2).max(1);
+                Err(err.into())
+            }
         }
+    }
+
+    /// Fetching by block hash ties the logs to exactly the header we linked.
+    async fn logs_by_block(&self, blocks: &[Block]) -> Result<Vec<Log>, IndexError> {
+        let per_block = concurrently(blocks.iter().map(|block| {
+            let filter = self.watched.filter().at_block_hash(block.hash);
+            async move {
+                self.provider
+                    .get_logs(&filter)
+                    .await
+                    .map_err(IndexError::from)
+            }
+        }))
+        .await?;
+        Ok(per_block.into_iter().flatten().collect())
+    }
+
+    async fn blocks(
+        &self,
+        numbers: impl IntoIterator<Item = u64>,
+    ) -> Result<Vec<Block>, IndexError> {
+        concurrently(numbers.into_iter().map(|number| self.block(number))).await
+    }
+
+    async fn block(&self, number: u64) -> Result<Block, IndexError> {
+        let header = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await?
+            .filter(|block| block.header.number == number)
+            .ok_or_else(|| Inconsistent(format!("node has no block {number}")))?
+            .header;
+        Ok(Block {
+            number,
+            hash: header.hash,
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+        })
+    }
+
+    async fn canonical_hash(&self, number: u64) -> Result<Option<B256>, IndexError> {
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await?;
+        Ok(block.map(|block| block.header.hash))
+    }
+}
+
+/// Runs up to `RPC_CONCURRENCY` requests at once, keeping results in order.
+async fn concurrently<T, F>(requests: impl Iterator<Item = F>) -> Result<Vec<T>, IndexError>
+where
+    F: Future<Output = Result<T, IndexError>>,
+{
+    let requests: Vec<F> = requests.collect();
+    stream::iter(requests)
+        .buffered(RPC_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+fn backoff(failures: u32) -> Duration {
+    Duration::from_millis(500)
+        .saturating_mul(2u32.saturating_pow(failures))
+        .min(MAX_BACKOFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        assert_eq!(backoff(0), Duration::from_millis(500));
+        assert_eq!(backoff(3), Duration::from_secs(4));
+        assert_eq!(backoff(40), MAX_BACKOFF);
     }
 }
