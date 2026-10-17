@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chainpulse_types::primitives::{Address, B256};
 use chainpulse_types::{Block, BlockRef, Event, EventKind, hex};
 use chrono::{DateTime, Utc};
@@ -24,6 +26,7 @@ pub enum DbError {
 pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, DbError> {
     Ok(PgPoolOptions::new()
         .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(10))
         .connect(url)
         .await?)
 }
