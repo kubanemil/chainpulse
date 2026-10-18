@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use chainpulse::api::{self, AppState};
-use chainpulse::indexer::{self, Indexer};
+use chainpulse::indexer::Indexer;
+use chainpulse::node::Node;
 use chainpulse::telemetry;
 use chainpulse_config::Config;
 use tokio::net::TcpListener;
@@ -15,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 const FEED_CAPACITY: usize = 4_096;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const API_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type TaskResult = (String, anyhow::Result<()>);
 
@@ -27,10 +29,21 @@ async fn main() -> anyhow::Result<()> {
         Config::load(&path).with_context(|| format!("loading config from {}", path.display()))?;
     let metrics = telemetry::install().context("installing the metrics recorder")?;
 
-    let pool = chainpulse_db::connect(&config.database.url, config.database.max_connections)
+    // Separate pools so slow API queries cannot starve the indexers of connections.
+    let indexer_slots = u32::try_from(config.chains.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let indexer_pool = chainpulse_db::connect(&config.database.url, indexer_slots, None)
         .await
         .context("connecting to Postgres")?;
-    chainpulse_db::migrate(&pool)
+    let api_pool = chainpulse_db::connect(
+        &config.database.url,
+        config.database.max_connections,
+        Some(API_STATEMENT_TIMEOUT),
+    )
+    .await
+    .context("connecting to Postgres")?;
+    chainpulse_db::migrate(&indexer_pool)
         .await
         .context("running migrations")?;
 
@@ -41,10 +54,10 @@ async fn main() -> anyhow::Result<()> {
 
     for chain in config.chains {
         let name = chain.name.clone();
-        let provider = indexer::connect(&chain.rpc_url)
+        let node = Node::connect(&chain.rpc_url, chain.rpc_timeout())
             .await
             .with_context(|| format!("connecting to the {name} node"))?;
-        let indexer = Indexer::new(chain, provider, pool.clone(), feed.clone()).await?;
+        let indexer = Indexer::new(chain, node, indexer_pool.clone(), feed.clone()).await?;
         statuses.push(indexer.status());
         tracing::info!(chain = %name, cursor = ?indexer.cursor().map(|c| c.number), "starting indexer");
         let token = shutdown.clone();
@@ -61,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.api.listen))?;
     tracing::info!(listen = %config.api.listen, "serving API");
     let state = AppState::new(
-        pool.clone(),
+        api_pool.clone(),
         feed,
         statuses,
         metrics,
@@ -106,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("tasks did not stop within {SHUTDOWN_GRACE:?}, aborting them");
         tasks.shutdown().await;
     }
-    pool.close().await;
+    indexer_pool.close().await;
+    api_pool.close().await;
 
     failure.map_or(Ok(()), Err)
 }

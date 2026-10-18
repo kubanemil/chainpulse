@@ -4,7 +4,7 @@ use chainpulse_types::primitives::{Address, B256};
 use chainpulse_types::{Block, BlockRef, Event, EventKind, hex};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{FromRow, Postgres, Transaction};
 
 pub use sqlx::PgPool;
@@ -23,11 +23,38 @@ pub enum DbError {
     OutOfRange(String),
 }
 
-pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, DbError> {
+impl DbError {
+    /// Lost connections and an exhausted pool clear up on retry. Everything else is a bug or bad data.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Sqlx(sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_)) => {
+                true
+            }
+            Self::Sqlx(sqlx::Error::Database(error)) => error.code().is_some_and(|code| {
+                code.starts_with("08")
+                    || matches!(
+                        &*code,
+                        "40001" | "40P01" | "53300" | "57P01" | "57P02" | "57P03"
+                    )
+            }),
+            _ => false,
+        }
+    }
+}
+
+pub async fn connect(
+    url: &str,
+    max_connections: u32,
+    statement_timeout: Option<Duration>,
+) -> Result<PgPool, DbError> {
+    let mut options: PgConnectOptions = url.parse()?;
+    if let Some(timeout) = statement_timeout {
+        options = options.options([("statement_timeout", format!("{}ms", timeout.as_millis()))]);
+    }
     Ok(PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(10))
-        .connect(url)
+        .connect_with(options)
         .await?)
 }
 
@@ -50,7 +77,6 @@ pub async fn load_cursor(pool: &PgPool, chain_id: u64) -> Result<Option<BlockRef
         .transpose()
 }
 
-/// Stored blocks, newest first. Rollback searches these for the common ancestor.
 pub async fn recent_blocks(pool: &PgPool, chain_id: u64) -> Result<Vec<BlockRef>, DbError> {
     let rows: Vec<(i64, String)> =
         sqlx::query_as("SELECT number, hash FROM blocks WHERE chain_id = $1 ORDER BY number DESC")
@@ -76,19 +102,15 @@ pub async fn block_hash(
     hash.map(|hash| parse_hash(&hash)).transpose()
 }
 
-/// One indexing step, written atomically: the blocks, their events and the cursor move together.
 #[derive(Debug)]
 pub struct Commit<'a> {
     pub chain_id: u64,
-    /// The cursor this step was built on. The write fails if the stored cursor differs.
+    /// The write fails unless this is still the stored cursor.
     pub parent: Option<BlockRef>,
     pub cursor: BlockRef,
     pub blocks: &'a [Block],
     pub events: &'a [Event],
-    /// Highest block that is final. Never moves backwards.
     pub confirmed_block: u64,
-    /// Blocks below this height are no longer needed to resolve a reorg.
-    pub prune_below: u64,
 }
 
 pub async fn commit(pool: &PgPool, commit: &Commit<'_>) -> Result<Vec<EventRecord>, DbError> {
@@ -96,14 +118,16 @@ pub async fn commit(pool: &PgPool, commit: &Commit<'_>) -> Result<Vec<EventRecor
     let confirmed_block = int(commit.confirmed_block)?;
     let mut tx = pool.begin().await?;
 
-    let moved =
+    // Head jitter can lower the reported height; the stored value never drops outside a rollback.
+    let confirmed: Option<i64> =
         match commit.parent {
             Some(parent) => {
-                sqlx::query(
+                sqlx::query_scalar(
                     "UPDATE chain_cursors
                  SET block_number = $2, block_hash = $3,
                      confirmed_block = GREATEST(confirmed_block, $4), updated_at = now()
-                 WHERE chain_id = $1 AND block_number = $5 AND block_hash = $6",
+                 WHERE chain_id = $1 AND block_number = $5 AND block_hash = $6
+                 RETURNING confirmed_block",
                 )
                 .bind(chain_id)
                 .bind(int(commit.cursor.number)?)
@@ -111,29 +135,32 @@ pub async fn commit(pool: &PgPool, commit: &Commit<'_>) -> Result<Vec<EventRecor
                 .bind(confirmed_block)
                 .bind(int(parent.number)?)
                 .bind(parent.hash.to_string())
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await?
             }
-            None => sqlx::query(
+            None => sqlx::query_scalar(
                 "INSERT INTO chain_cursors (chain_id, block_number, block_hash, confirmed_block)
                  VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (chain_id) DO NOTHING",
+                 ON CONFLICT (chain_id) DO NOTHING
+                 RETURNING confirmed_block",
             )
             .bind(chain_id)
             .bind(int(commit.cursor.number)?)
             .bind(commit.cursor.hash.to_string())
             .bind(confirmed_block)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?,
         };
-    if moved.rows_affected() != 1 {
+    let Some(confirmed_block) = confirmed else {
         return Err(DbError::CursorConflict(commit.chain_id));
-    }
+    };
 
     insert_blocks(&mut tx, chain_id, commit.blocks).await?;
-    sqlx::query("DELETE FROM blocks WHERE chain_id = $1 AND number < $2")
+    // Hashes below the confirmed height are never needed to find a common ancestor.
+    sqlx::query("DELETE FROM blocks WHERE chain_id = $1 AND number < LEAST($2, $3)")
         .bind(chain_id)
-        .bind(int(commit.prune_below)?)
+        .bind(int(commit.cursor.number)?)
+        .bind(confirmed_block)
         .execute(&mut *tx)
         .await?;
     let mut records = insert_events(&mut tx, chain_id, commit.events, confirmed_block).await?;
@@ -226,8 +253,6 @@ async fn insert_events(
     Ok(records)
 }
 
-/// Moves the cursor back from `from` to `ancestor` and deletes everything above it. Returns
-/// how many events were removed.
 pub async fn rollback(
     pool: &PgPool,
     chain_id: u64,
@@ -239,7 +264,9 @@ pub async fn rollback(
     let mut tx = pool.begin().await?;
 
     let moved = sqlx::query(
-        "UPDATE chain_cursors SET block_number = $2, block_hash = $3, updated_at = now()
+        "UPDATE chain_cursors
+         SET block_number = $2, block_hash = $3,
+             confirmed_block = LEAST(confirmed_block, $2), updated_at = now()
          WHERE chain_id = $1 AND block_number = $4 AND block_hash = $5",
     )
     .bind(id)
@@ -286,13 +313,12 @@ pub struct EventRecord {
 
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
-    pub chain_id: Option<u64>,
+    pub chain_id: Option<i64>,
     pub event_type: Option<EventKind>,
     pub contract: Option<Address>,
-    pub from_block: Option<u64>,
-    pub to_block: Option<u64>,
+    pub from_block: Option<i64>,
+    pub to_block: Option<i64>,
     pub confirmed: Option<bool>,
-    /// Keyset cursor: only events with a smaller id.
     pub before_id: Option<i64>,
     pub limit: u32,
 }
@@ -303,7 +329,6 @@ const SELECT_EVENTS: &str =
         e.block_number <= c.confirmed_block AS confirmed
     FROM events e JOIN chain_cursors c ON c.chain_id = e.chain_id";
 
-/// Newest first. Pages are stable while new events arrive because they are keyed on id.
 pub async fn list_events(pool: &PgPool, query: &EventQuery) -> Result<Vec<EventRecord>, DbError> {
     let sql = format!(
         "{SELECT_EVENTS}
@@ -318,11 +343,11 @@ pub async fn list_events(pool: &PgPool, query: &EventQuery) -> Result<Vec<EventR
          LIMIT $8"
     );
     Ok(sqlx::query_as(&sql)
-        .bind(query.chain_id.map(int).transpose()?)
+        .bind(query.chain_id)
         .bind(query.event_type.map(EventKind::name))
         .bind(query.contract.as_ref().map(hex))
-        .bind(query.from_block.map(int).transpose()?)
-        .bind(query.to_block.map(int).transpose()?)
+        .bind(query.from_block)
+        .bind(query.to_block)
         .bind(query.confirmed)
         .bind(query.before_id)
         .bind(i64::from(query.limit))
@@ -359,4 +384,21 @@ fn block_ref(number: i64, hash: &str) -> Result<BlockRef, DbError> {
         number,
         hash: parse_hash(hash)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn lost_connections_are_transient_and_bad_data_is_not() {
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+
+        assert!(DbError::Sqlx(sqlx::Error::PoolTimedOut).is_transient());
+        assert!(DbError::Sqlx(sqlx::Error::Io(reset)).is_transient());
+        assert!(!DbError::Sqlx(sqlx::Error::RowNotFound).is_transient());
+        assert!(!DbError::CursorConflict(1).is_transient());
+        assert!(!DbError::OutOfRange("block".into()).is_transient());
+    }
 }

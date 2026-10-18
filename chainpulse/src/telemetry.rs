@@ -7,7 +7,7 @@ const LAG_BLOCKS: &str = "chainpulse_lag_blocks";
 const REORGS: &str = "chainpulse_reorgs_total";
 const REORG_DEPTH: &str = "chainpulse_reorg_depth_blocks";
 const EVENTS: &str = "chainpulse_events_indexed_total";
-const RPC_ERRORS: &str = "chainpulse_rpc_errors_total";
+const STEP_ERRORS: &str = "chainpulse_step_errors_total";
 const WS_CLIENTS: &str = "chainpulse_ws_clients";
 
 pub fn install() -> Result<PrometheusHandle, BuildError> {
@@ -23,18 +23,17 @@ pub fn install() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(REORGS, "Reorgs that rolled the cursor back");
     describe_histogram!(REORG_DEPTH, "Blocks rolled back per reorg");
     describe_counter!(EVENTS, "Events written, by chain and event type");
-    describe_counter!(RPC_ERRORS, "Failed indexer steps caused by the node");
+    describe_counter!(STEP_ERRORS, "Indexer steps that failed and will be retried");
     describe_gauge!(WS_CLIENTS, "Connected WebSocket clients");
     Ok(handle)
 }
 
-pub fn head(chain: &str, head: u64) {
+pub fn progress(chain: &str, head: u64, indexed: Option<u64>) {
     gauge!(HEAD_BLOCK, "chain" => chain.to_owned()).set(head as f64);
-}
-
-pub fn progress(chain: &str, head: u64, indexed: u64) {
-    gauge!(INDEXED_BLOCK, "chain" => chain.to_owned()).set(indexed as f64);
-    gauge!(LAG_BLOCKS, "chain" => chain.to_owned()).set(head.saturating_sub(indexed) as f64);
+    if let Some(indexed) = indexed {
+        gauge!(INDEXED_BLOCK, "chain" => chain.to_owned()).set(indexed as f64);
+        gauge!(LAG_BLOCKS, "chain" => chain.to_owned()).set(head.saturating_sub(indexed) as f64);
+    }
 }
 
 pub fn reorg(chain: &str, depth: u64) {
@@ -47,8 +46,8 @@ pub fn events_indexed(chain: &str, event_type: &str, count: u64) {
         .increment(count);
 }
 
-pub fn rpc_error(chain: &str) {
-    counter!(RPC_ERRORS, "chain" => chain.to_owned()).increment(1);
+pub fn step_error(chain: &str) {
+    counter!(STEP_ERRORS, "chain" => chain.to_owned()).increment(1);
 }
 
 pub fn ws_client_connected() {

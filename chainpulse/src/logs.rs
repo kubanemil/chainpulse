@@ -1,11 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use alloy::primitives::{Address, B256};
 use alloy::rpc::types::{Filter, Log};
 use chainpulse_config::ContractConfig;
 use chainpulse_types::{Block, Event, EventKind};
 
-/// The (contract, event) pairs a chain is configured to index.
 #[derive(Debug, Clone)]
 pub struct Watched {
     kinds: HashMap<(Address, B256), EventKind>,
@@ -47,14 +46,27 @@ impl Watched {
 #[error("{0}")]
 pub struct Inconsistent(pub String);
 
-/// Turns fetched logs into events, checking each log belongs to the header fetched for its block.
-/// `blocks` must be ascending.
+/// Headers for the range ends link the cursor; others only supply timestamps the logs lack.
+pub fn headers_needed(from: u64, to: u64, logs: &[Log]) -> BTreeSet<u64> {
+    let mut numbers: BTreeSet<u64> = logs
+        .iter()
+        .filter(|log| log.block_timestamp.is_none())
+        .filter_map(|log| log.block_number)
+        .collect();
+    numbers.extend([from, to]);
+    numbers
+}
+
+/// Every log must agree on its block's hash with the fetched header and with other logs from
+/// that block, so one response cannot mix forks.
 pub fn assemble(
     chain_id: u64,
     blocks: &[Block],
     logs: &[Log],
     watched: &Watched,
 ) -> Result<Vec<Event>, Inconsistent> {
+    let mut hashes: HashMap<u64, B256> = blocks.iter().map(|b| (b.number, b.hash)).collect();
+    let timestamps: HashMap<u64, u64> = blocks.iter().map(|b| (b.number, b.timestamp)).collect();
     let mut events = Vec::new();
     for log in logs {
         if log.removed {
@@ -70,26 +82,24 @@ pub fn assemble(
                 "node returned a log without a block position".to_owned(),
             ));
         };
-        let block = blocks
-            .binary_search_by_key(&number, |b| b.number)
-            .ok()
-            .and_then(|i| blocks.get(i))
-            .ok_or_else(|| Inconsistent(format!("log in block {number}, which was not fetched")))?;
-        if block.hash != block_hash {
+        let expected = *hashes.entry(number).or_insert(block_hash);
+        if expected != block_hash {
             return Err(Inconsistent(format!(
-                "log in block {number} has block hash {block_hash}, header has {}",
-                block.hash
+                "log in block {number} has block hash {block_hash}, expected {expected}"
             )));
         }
         let Some(kind) = watched.kind(log) else {
             continue;
+        };
+        let Some(block_timestamp) = timestamps.get(&number).copied().or(log.block_timestamp) else {
+            return Err(Inconsistent(format!("no timestamp for block {number}")));
         };
         match kind.decode(&log.inner.data) {
             Ok(payload) => events.push(Event {
                 chain_id,
                 block_number: number,
                 block_hash,
-                block_timestamp: block.timestamp,
+                block_timestamp,
                 log_index,
                 tx_hash,
                 contract: log.address(),
@@ -216,9 +226,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_logs_for_blocks_that_were_not_fetched() {
+    fn takes_the_timestamp_from_the_log_when_the_header_was_not_fetched() {
+        let mut log = transfer_log(TOKEN, &header(7), 0);
+        log.block_timestamp = Some(1_700_000_007);
+
+        let events = assemble(1, &[header(5)], &[log], &watched()).unwrap();
+
+        assert_eq!(events[0].block_timestamp, 1_700_000_007);
+    }
+
+    #[test]
+    fn rejects_a_log_with_neither_header_nor_timestamp() {
         let log = transfer_log(TOKEN, &header(7), 0);
 
-        assert!(assemble(1, &[header(5)], &[log], &watched()).is_err());
+        let err = assemble(1, &[header(5)], &[log], &watched()).unwrap_err();
+
+        assert!(err.0.contains("no timestamp for block 7"), "{err}");
+    }
+
+    #[test]
+    fn rejects_logs_of_one_block_that_disagree_on_its_hash() {
+        let mut first = transfer_log(TOKEN, &header(7), 0);
+        let mut second = transfer_log(TOKEN, &header(7), 1);
+        first.block_timestamp = Some(1);
+        second.block_timestamp = Some(1);
+        second.block_hash = Some(B256::repeat_byte(0xab));
+
+        assert!(assemble(1, &[], &[first, second], &watched()).is_err());
+    }
+
+    #[test]
+    fn fetches_headers_only_for_range_ends_when_logs_carry_timestamps() {
+        let mut stamped = transfer_log(TOKEN, &header(7), 0);
+        stamped.block_timestamp = Some(1);
+        let unstamped = transfer_log(TOKEN, &header(8), 0);
+
+        assert_eq!(headers_needed(5, 9, &[stamped]), BTreeSet::from([5, 9]));
+        assert_eq!(
+            headers_needed(5, 9, &[unstamped]),
+            BTreeSet::from([5, 8, 9])
+        );
     }
 }

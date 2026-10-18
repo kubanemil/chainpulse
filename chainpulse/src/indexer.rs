@@ -1,12 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::B256;
-use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::Log;
-use alloy::transports::TransportError;
 use chainpulse_config::ChainConfig;
 use chainpulse_db::{self as db, Commit, DbError, PgPool};
 use chainpulse_types::{Block, BlockRef};
@@ -15,6 +12,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::logs::{self, Inconsistent, Watched};
+use crate::node::{Node, NodeError};
 use crate::reorg::{self, Broken, Plan};
 use crate::status::{ChainStatus, Progress};
 use crate::telemetry;
@@ -25,8 +23,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    #[error("rpc: {0}")]
-    Rpc(#[from] TransportError),
+    #[error("node: {0}")]
+    Node(#[from] NodeError),
     #[error("node returned inconsistent data: {0}")]
     Inconsistent(#[from] Inconsistent),
     #[error(transparent)]
@@ -40,9 +38,12 @@ pub enum IndexError {
 }
 
 impl IndexError {
-    /// Node trouble is retried with backoff. Anything else stops the process.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Rpc(_) | Self::Inconsistent(_))
+        match self {
+            Self::Node(_) | Self::Inconsistent(_) => true,
+            Self::Db(error) => error.is_transient(),
+            Self::WrongChain { .. } | Self::ReorgTooDeep { .. } => false,
+        }
     }
 }
 
@@ -60,29 +61,24 @@ pub enum Step {
     },
 }
 
-pub async fn connect(rpc_url: &str) -> Result<RootProvider, TransportError> {
-    RootProvider::connect(rpc_url).await
-}
-
-/// Indexes one chain. Each step polls the head, fetches what is new, checks it links onto the
-/// stored chain, and commits blocks, events and cursor in one transaction.
 pub struct Indexer {
     chain: ChainConfig,
-    provider: RootProvider,
+    node: Node,
     pool: PgPool,
     watched: Watched,
     feed: broadcast::Sender<Notification>,
     progress: watch::Sender<Progress>,
     cursor: Option<BlockRef>,
     chain_verified: bool,
-    /// Block range per `eth_getLogs` call. Halves when the node rejects a range, grows back on success.
+    reconnect: bool,
+    /// Blocks per `eth_getLogs` range. Halves while the node rejects the range size.
     span: u64,
 }
 
 impl Indexer {
     pub async fn new(
         chain: ChainConfig,
-        provider: RootProvider,
+        node: Node,
         pool: PgPool,
         feed: broadcast::Sender<Notification>,
     ) -> Result<Self, IndexError> {
@@ -95,12 +91,13 @@ impl Indexer {
             watched: Watched::new(&chain.contracts),
             span: chain.max_block_range,
             chain,
-            provider,
+            node,
             pool,
             feed,
             progress,
             cursor,
             chain_verified: false,
+            reconnect: false,
         })
     }
 
@@ -118,7 +115,6 @@ impl Indexer {
         self.cursor
     }
 
-    /// Runs until `shutdown` fires. Returns an error only for failures retrying cannot fix.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<(), IndexError> {
         let mut failures: u32 = 0;
         loop {
@@ -136,7 +132,7 @@ impl Indexer {
                     }
                 }
                 Err(err) if err.is_transient() => {
-                    telemetry::rpc_error(&self.chain.name);
+                    telemetry::step_error(&self.chain.name);
                     let delay = backoff(failures);
                     failures = failures.saturating_add(1);
                     tracing::warn!(chain = %self.chain.name, error = %err, retry_in = ?delay, "step failed");
@@ -154,8 +150,27 @@ impl Indexer {
     }
 
     pub async fn step(&mut self) -> Result<Step, IndexError> {
+        let result = self.try_step().await;
+        if let Err(IndexError::Node(error)) = &result
+            && error.is_backend_gone()
+        {
+            self.reconnect = true;
+        }
+        let head = self.progress.borrow().head;
+        if let Some(head) = head {
+            telemetry::progress(&self.chain.name, head, self.cursor.map(|c| c.number));
+        }
+        result
+    }
+
+    async fn try_step(&mut self) -> Result<Step, IndexError> {
+        if self.reconnect {
+            self.node.reconnect().await?;
+            self.reconnect = false;
+            tracing::info!(chain = %self.chain.name, "reconnected to the node");
+        }
         if !self.chain_verified {
-            let actual = self.provider.get_chain_id().await?;
+            let actual = self.node.chain_id().await?;
             if actual != self.chain.id {
                 return Err(IndexError::WrongChain {
                     expected: self.chain.id,
@@ -165,16 +180,14 @@ impl Indexer {
             self.chain_verified = true;
         }
 
-        let head = self.provider.get_block_number().await?;
-        telemetry::head(&self.chain.name, head);
+        let head = self.node.block_number().await?;
         self.progress.send_modify(|p| {
             p.head = Some(head);
             p.polled_at = Some(Instant::now());
         });
 
-        let cursor = self.cursor.map(|c| c.number);
         let plan = reorg::plan(
-            cursor,
+            self.cursor.map(|c| c.number),
             self.chain.start_block,
             head,
             self.chain.confirmations,
@@ -187,7 +200,7 @@ impl Indexer {
         }
     }
 
-    /// Nothing new to index; a reorg may still have replaced blocks at or below the head.
+    /// A reorg can replace blocks at or below the head without the head moving.
     async fn verify(&mut self, number: u64) -> Result<Step, IndexError> {
         let stored = match self.cursor {
             Some(cursor) if cursor.number == number => Some(cursor.hash),
@@ -216,10 +229,8 @@ impl Indexer {
             (blocks, logs)
         } else {
             let logs = self.logs_in_range(from, to).await?;
-            let mut numbers: BTreeSet<u64> =
-                logs.iter().filter_map(|log| log.block_number).collect();
-            numbers.extend([from, to]);
-            (self.blocks(numbers).await?, logs)
+            let blocks = self.blocks(logs::headers_needed(from, to, &logs)).await?;
+            (blocks, logs)
         };
 
         match reorg::check_links(self.cursor, &blocks) {
@@ -235,7 +246,6 @@ impl Indexer {
         let Some(tip) = blocks.last().map(Block::to_ref) else {
             return Err(Inconsistent("no blocks fetched".to_owned()).into());
         };
-        let confirmed_block = head.saturating_sub(self.chain.confirmations);
 
         let records = db::commit(
             &self.pool,
@@ -245,12 +255,13 @@ impl Indexer {
                 cursor: tip,
                 blocks: &blocks,
                 events: &events,
-                confirmed_block,
-                prune_below: tip.number.min(confirmed_block),
+                confirmed_block: head.saturating_sub(self.chain.confirmations),
             },
         )
         .await?;
         self.cursor = Some(tip);
+        self.progress.send_modify(|p| p.indexed = Some(tip.number));
+        self.span = self.span.saturating_mul(2).min(self.chain.max_block_range);
 
         let mut per_type: HashMap<&str, u64> = HashMap::new();
         for event in &events {
@@ -259,8 +270,6 @@ impl Indexer {
         for (event_type, count) in per_type {
             telemetry::events_indexed(&self.chain.name, event_type, count);
         }
-        telemetry::progress(&self.chain.name, head, tip.number);
-        self.progress.send_modify(|p| p.indexed = Some(tip.number));
         tracing::debug!(chain = %self.chain.name, from, to, events = records.len(), "indexed");
 
         let events = records.len();
@@ -273,8 +282,6 @@ impl Indexer {
         })
     }
 
-    /// The cursor is no longer canonical. Walk stored blocks from newest to oldest until the node
-    /// agrees with one, then drop everything above it.
     async fn roll_back(&mut self) -> Result<Step, IndexError> {
         let Some(cursor) = self.cursor else {
             return Err(
@@ -297,9 +304,9 @@ impl Indexer {
             let removed_events = db::rollback(&self.pool, self.chain.id, cursor, ancestor).await?;
             let depth = cursor.number - ancestor.number;
             self.cursor = Some(ancestor);
-            telemetry::reorg(&self.chain.name, depth);
             self.progress
                 .send_modify(|p| p.indexed = Some(ancestor.number));
+            telemetry::reorg(&self.chain.name, depth);
             tracing::warn!(
                 chain = %self.chain.name, from = cursor.number, to = ancestor.number, depth, removed_events,
                 "reorg: rolled back to common ancestor"
@@ -324,29 +331,19 @@ impl Indexer {
 
     async fn logs_in_range(&mut self, from: u64, to: u64) -> Result<Vec<Log>, IndexError> {
         let filter = self.watched.filter().from_block(from).to_block(to);
-        match self.provider.get_logs(&filter).await {
-            Ok(logs) => {
-                self.span = self.span.saturating_mul(2).min(self.chain.max_block_range);
-                Ok(logs)
-            }
-            Err(err) => {
-                // Providers cap results per call; a smaller range is the usual fix.
+        self.node.logs(&filter).await.map_err(|error| {
+            if error.is_range_too_large() {
                 self.span = (self.span / 2).max(1);
-                Err(err.into())
             }
-        }
+            error.into()
+        })
     }
 
-    /// Fetching by block hash ties the logs to exactly the header we linked.
+    /// A `blockHash` filter ties the logs to exactly the header that was linked.
     async fn logs_by_block(&self, blocks: &[Block]) -> Result<Vec<Log>, IndexError> {
         let per_block = concurrently(blocks.iter().map(|block| {
             let filter = self.watched.filter().at_block_hash(block.hash);
-            async move {
-                self.provider
-                    .get_logs(&filter)
-                    .await
-                    .map_err(IndexError::from)
-            }
+            async move { self.node.logs(&filter).await.map_err(IndexError::from) }
         }))
         .await?;
         Ok(per_block.into_iter().flatten().collect())
@@ -360,31 +357,19 @@ impl Indexer {
     }
 
     async fn block(&self, number: u64) -> Result<Block, IndexError> {
-        let header = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Number(number))
+        self.node
+            .block(number)
             .await?
-            .filter(|block| block.header.number == number)
-            .ok_or_else(|| Inconsistent(format!("node has no block {number}")))?
-            .header;
-        Ok(Block {
-            number,
-            hash: header.hash,
-            parent_hash: header.parent_hash,
-            timestamp: header.timestamp,
-        })
+            .filter(|block| block.number == number)
+            .ok_or_else(|| Inconsistent(format!("node has no block {number}")).into())
     }
 
     async fn canonical_hash(&self, number: u64) -> Result<Option<B256>, IndexError> {
-        let block = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Number(number))
-            .await?;
-        Ok(block.map(|block| block.header.hash))
+        Ok(self.node.block(number).await?.map(|block| block.hash))
     }
 }
 
-/// Runs up to `RPC_CONCURRENCY` requests at once, keeping results in order.
+// Collected first: buffering a lazily mapped iterator trips a higher-ranked Send error in spawn.
 async fn concurrently<T, F>(requests: impl Iterator<Item = F>) -> Result<Vec<T>, IndexError>
 where
     F: Future<Output = Result<T, IndexError>>,
@@ -411,5 +396,14 @@ mod tests {
         assert_eq!(backoff(0), Duration::from_millis(500));
         assert_eq!(backoff(3), Duration::from_secs(4));
         assert_eq!(backoff(40), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn database_outages_are_retried_but_data_errors_stop_the_process() {
+        let outage = IndexError::Db(DbError::Sqlx(sqlx::Error::PoolTimedOut));
+        let conflict = IndexError::Db(DbError::CursorConflict(1));
+
+        assert!(outage.is_transient());
+        assert!(!conflict.is_transient());
     }
 }

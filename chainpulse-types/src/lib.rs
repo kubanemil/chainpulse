@@ -69,12 +69,13 @@ mod aave_v3 {
         #[derive(Debug)]
         event Withdraw(address indexed reserve, address indexed user, address indexed to, uint256 amount);
 
+        // StakedTokenV3, live on stkAAVE since its 2023 upgrade.
         #[derive(Debug)]
-        event Staked(address indexed from, address indexed onBehalfOf, uint256 amount);
+        event Staked(address indexed from, address indexed to, uint256 assets, uint256 shares);
     }
 }
 
-/// An event ChainPulse knows how to decode. The name is what config files and the API use.
+/// `name()` is the identifier in config files and the API, so renaming one is a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EventKind {
     Transfer,
@@ -125,7 +126,7 @@ impl EventKind {
         }
     }
 
-    /// Decodes the log into a JSON payload. Integers are strings so no precision is lost.
+    /// Integers become strings so 256-bit values survive JSON.
     pub fn decode(self, log: &LogData) -> alloy::sol_types::Result<Value> {
         let payload = match self {
             Self::Transfer => {
@@ -197,8 +198,9 @@ impl EventKind {
                 let e = aave_v3::Staked::decode_log_data(log)?;
                 json!({
                     "from": hex(&e.from),
-                    "on_behalf_of": hex(&e.onBehalfOf),
-                    "amount": e.amount.to_string(),
+                    "to": hex(&e.to),
+                    "assets": e.assets.to_string(),
+                    "shares": e.shares.to_string(),
                 })
             }
         };
@@ -253,7 +255,7 @@ impl<'de> Deserialize<'de> for EventKind {
     }
 }
 
-/// Lowercase `0x` hex, the one address format stored and served everywhere.
+/// Stored and filtered addresses must all use this one form.
 pub fn hex(address: &Address) -> String {
     format!("{address:#x}")
 }
@@ -281,7 +283,6 @@ impl Block {
     }
 }
 
-/// A decoded log from a block the indexer has verified against the chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub chain_id: u64,
@@ -298,7 +299,7 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{I256, U160, U256, address, aliases::I24, aliases::U24};
+    use alloy::primitives::{I256, U160, U256, address, aliases::I24, aliases::U24, b256};
     use std::collections::HashSet;
 
     const A: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -406,12 +407,6 @@ mod tests {
             amount: U256::from(7u64),
         }
         .encode_log_data();
-        let staked = aave_v3::Staked {
-            from: A,
-            onBehalfOf: B,
-            amount: U256::from(9u64),
-        }
-        .encode_log_data();
 
         assert_eq!(
             EventKind::Supply.decode(&supply).unwrap()["referral_code"],
@@ -421,7 +416,22 @@ mod tests {
             EventKind::Withdraw.decode(&withdraw).unwrap()["amount"],
             "7"
         );
-        assert_eq!(EventKind::Staked.decode(&staked).unwrap()["amount"], "9");
+    }
+
+    #[test]
+    fn decodes_stkaave_staked_as_emitted_on_mainnet() {
+        // Topic and data of the Staked log in tx 0x972c5d97d6d34ebf7fa6faff00ba33eb7e90c8d246e23fbf323640b3ce9d057f.
+        let topic0 = b256!("6c86f3fd5118b3aa8bb4f389a617046de0a3d3d477de1a1673d227f802f616dc");
+        let amount = "0000000000000000000000000000000000000000000000004f4427c51a8fb4ac";
+        let data = alloy::primitives::hex::decode(format!("{amount}{amount}")).unwrap();
+        let log = LogData::new_unchecked(vec![topic0, A.into_word(), B.into_word()], data.into());
+
+        let payload = EventKind::Staked.decode(&log).unwrap();
+
+        assert_eq!(EventKind::Staked.topic0(), topic0);
+        assert_eq!(payload["assets"], "5711733954920297644");
+        assert_eq!(payload["shares"], "5711733954920297644");
+        assert_eq!(payload["to"], "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     }
 
     #[test]

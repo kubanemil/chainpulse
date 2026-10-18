@@ -24,7 +24,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-alloy = { workspace = true, features = ["contract", "node-bindings", "provider-anvil-api", "signer-local"] }
+alloy = { workspace = true, features = ["contract", "json-rpc", "node-bindings", "provider-anvil-api", "signer-local"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 sqlx = { workspace = true }
 tokio-tungstenite = "0.28"

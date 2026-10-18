@@ -1,5 +1,4 @@
-//! A real anvil chain with a deployed ERC-20, and helpers to compare what the indexer stored
-//! against what the chain says. Tests need anvil on PATH and DATABASE_URL pointing at Postgres.
+//! Tests need anvil on PATH and DATABASE_URL pointing at Postgres.
 
 #![allow(dead_code, clippy::expect_used)]
 
@@ -12,7 +11,8 @@ use alloy::providers::ext::AnvilApi;
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
-use chainpulse::indexer::{self, Indexer, Step};
+use chainpulse::indexer::{Indexer, Step};
+use chainpulse::node::Node;
 use chainpulse::ws::Notification;
 use chainpulse_config::{ChainConfig, ContractConfig};
 use chainpulse_db::PgPool;
@@ -35,7 +35,6 @@ pub struct Chain {
     pub token: TestToken::TestTokenInstance<DynProvider>,
 }
 
-/// What the tests compare: position, fork, transaction, value and time of every Transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRow {
     pub block_number: i64,
@@ -72,21 +71,12 @@ impl Chain {
     }
 
     pub fn config(&self, confirmations: u64) -> ChainConfig {
-        ChainConfig {
-            id: self.chain_id,
-            name: "anvil".into(),
-            rpc_url: self.rpc_url.clone(),
+        chain_config(
+            self.chain_id,
+            &self.rpc_url,
+            *self.token.address(),
             confirmations,
-            start_block: Some(0),
-            poll_interval_ms: 50,
-            max_block_range: 1_000,
-            max_lag_blocks: 5,
-            contracts: vec![ContractConfig {
-                name: "token".into(),
-                address: *self.token.address(),
-                events: vec![EventKind::Transfer],
-            }],
-        }
+        )
     }
 
     pub async fn indexer(&self, pool: &PgPool, config: ChainConfig) -> Indexer {
@@ -100,10 +90,10 @@ impl Chain {
         config: ChainConfig,
         feed: broadcast::Sender<Notification>,
     ) -> Indexer {
-        let provider = indexer::connect(&self.rpc_url)
+        let node = Node::connect(&self.rpc_url, Duration::from_secs(5))
             .await
             .expect("connect to anvil");
-        Indexer::new(config, provider, pool.clone(), feed)
+        Indexer::new(config, node, pool.clone(), feed)
             .await
             .expect("create indexer")
     }
@@ -182,6 +172,25 @@ impl Chain {
     }
 }
 
+pub fn chain_config(id: u64, rpc_url: &str, token: Address, confirmations: u64) -> ChainConfig {
+    ChainConfig {
+        id,
+        name: "anvil".into(),
+        rpc_url: rpc_url.to_owned(),
+        confirmations,
+        start_block: Some(0),
+        poll_interval_ms: 50,
+        rpc_timeout_ms: 1_000,
+        max_block_range: 1_000,
+        max_lag_blocks: 5,
+        contracts: vec![ContractConfig {
+            name: "token".into(),
+            address: token,
+            events: vec![EventKind::Transfer],
+        }],
+    }
+}
+
 pub async fn migrated(pool: &PgPool) {
     chainpulse_db::migrate(pool).await.expect("migrate");
 }
@@ -216,7 +225,6 @@ pub async fn stored_cursor(pool: &PgPool) -> (i64, String) {
         .expect("read cursor")
 }
 
-/// Steps until the indexer has nothing left to do.
 pub async fn sync(indexer: &mut Indexer) -> Vec<Step> {
     let mut steps = Vec::new();
     loop {
@@ -229,7 +237,6 @@ pub async fn sync(indexer: &mut Indexer) -> Vec<Step> {
     }
 }
 
-/// The database holds exactly the chain's canonical transfers and the cursor sits on its head.
 pub async fn assert_matches_chain(pool: &PgPool, chain: &Chain) {
     assert_eq!(stored_transfers(pool).await, chain.transfers().await);
     let head = chain.head().await;
