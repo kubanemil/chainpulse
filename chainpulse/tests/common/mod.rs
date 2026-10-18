@@ -1,5 +1,3 @@
-//! Tests need anvil on PATH and DATABASE_URL pointing at Postgres.
-
 #![allow(dead_code, clippy::expect_used)]
 
 use std::time::Duration;

@@ -35,7 +35,6 @@ pub struct Config {
 pub struct DatabaseConfig {
     #[serde(default)]
     pub url: String,
-    /// Pool for API queries. Each indexer has its own connection.
     #[serde(default = "defaults::max_connections")]
     pub max_connections: u32,
 }
